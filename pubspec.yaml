@@ -19,7 +19,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 version: 1.0.0+1
 
 environment:
-  sdk: ^3.13.2
+  sdk: ^3.5.0
 
 # Dependencies specify other packages that your package needs in order to work.
 # To automatically upgrade your package dependencies to the latest versions
@@ -39,6 +39,7 @@ dependencies:
   cloud_firestore: ^6.9.0
   firebase_auth: ^6.6.1
   shared_preferences: ^2.5.5
+  crypto: ^3.0.6
   audioplayers: ^6.8.1
   flame_audio: ^2.1.0
   pdf: ^3.11.1

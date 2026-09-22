@@ -12,6 +12,9 @@ import 'package:flame/collisions.dart';
 import 'package:flame/events.dart';
 import 'package:flame_audio/flame_audio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:crypto/crypto.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
@@ -26,6 +29,85 @@ class GameClock {
   static double t = 0;
 }
 
+// =====================================================================
+// CLOUD SYNC (Firebase Cloud Firestore)
+// =====================================================================
+// Accounts, high scores, difficulty progress and the admin's difficulty
+// settings live in Firestore so every device/browser sees the same data.
+//
+// SETUP (once): create a Firebase project, add a Web app, and paste its
+// config values below. Until that is done — or if Firebase cannot be
+// reached — every store below automatically falls back to the original
+// on-device SharedPreferences behaviour, so the game still runs.
+class FirebaseConfig {
+  static const String apiKey = 'PASTE_API_KEY';
+  static const String appId = 'PASTE_APP_ID';
+  static const String messagingSenderId = 'PASTE_MESSAGING_SENDER_ID';
+  static const String projectId = 'PASTE_PROJECT_ID';
+  static const String authDomain = 'PASTE_PROJECT_ID.firebaseapp.com';
+  static const String storageBucket = 'PASTE_PROJECT_ID.appspot.com';
+
+  static bool get isConfigured => !apiKey.startsWith('PASTE_');
+
+  static FirebaseOptions get options => const FirebaseOptions(
+        apiKey: apiKey,
+        appId: appId,
+        messagingSenderId: messagingSenderId,
+        projectId: projectId,
+        authDomain: authDomain,
+        storageBucket: storageBucket,
+      );
+}
+
+/// Owns the Firestore connection and the shared collection references.
+///
+/// [enabled] is the single switch every store checks: when it is false
+/// the game behaves exactly like the old offline-only build.
+class CloudSync {
+  static bool _enabled = false;
+  static bool get enabled => _enabled;
+
+  static FirebaseFirestore get _db => FirebaseFirestore.instance;
+
+  static CollectionReference<Map<String, dynamic>> get users => _db.collection('users');
+  static CollectionReference<Map<String, dynamic>> get scores => _db.collection('scores');
+  static CollectionReference<Map<String, dynamic>> get progress => _db.collection('progress');
+  static CollectionReference<Map<String, dynamic>> get config => _db.collection('config');
+
+  /// Connects to Firebase. Never throws: a missing config, an offline
+  /// machine or a rejected request just leaves the game in local mode.
+  static Future<void> init() async {
+    if (!FirebaseConfig.isConfigured) {
+      debugPrint('CloudSync: Firebase not configured — using on-device storage.');
+      return;
+    }
+    try {
+      await Firebase.initializeApp(options: FirebaseConfig.options);
+      // A cheap round-trip proves the project really is reachable before
+      // the stores start routing reads and writes through it.
+      await _db.collection('config').doc('ping').get();
+      _enabled = true;
+      debugPrint('CloudSync: connected to project ${FirebaseConfig.projectId}.');
+    } catch (e) {
+      _enabled = false;
+      debugPrint('CloudSync: unavailable ($e) — using on-device storage.');
+    }
+  }
+
+  /// Document id for a player. Usernames stay case-insensitive, exactly
+  /// like the old SharedPreferences keys.
+  static String userId(String username) => username.trim().toLowerCase();
+
+  static String newSalt() {
+    final rand = Random.secure();
+    return List.generate(16, (_) => rand.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
+  }
+
+  /// Passwords are never stored in the clear once the cloud is in use.
+  static String hashPassword(String password, String salt) =>
+      sha256.convert(utf8.encode('$salt::$password')).toString();
+}
+
 // --- USER ACCOUNT STORAGE ---
 // Result of a login attempt.
 enum UserLoginResult {
@@ -35,7 +117,16 @@ enum UserLoginResult {
 }
 
 /// Handles persistent storage of registered player accounts
-/// (username -> password + createdAt) using SharedPreferences.
+/// (username -> password + createdAt).
+///
+/// When [CloudSync.enabled] is true every account lives in the Firestore
+/// `users` collection — one document per player, keyed by the lowercase
+/// username — so the same roster, logins and registration dates are
+/// shared by every device running the game. Passwords are stored as a
+/// salted SHA-256 hash there and are never readable back.
+///
+/// Without a reachable Firebase project the class behaves exactly as
+/// before, keeping accounts in SharedPreferences on that one device.
 ///
 /// IMPORTANT: every method here re-reads the saved data from disk right
 /// before it needs it, instead of relying on a cached in-memory Map.
@@ -48,6 +139,8 @@ class UserStorage {
   /// Loads the raw account details for every registered user as
   /// {lowercase_username: {'password': ..., 'createdAt': isoString}}.
   static Future<Map<String, Map<String, String>>> _loadUsersRaw() async {
+    if (CloudSync.enabled) return _loadUsersRawCloud();
+
     final prefs = await SharedPreferences.getInstance();
     final String? usersJson = prefs.getString(_usersKey);
     if (usersJson == null || usersJson.isEmpty) return {};
@@ -75,6 +168,20 @@ class UserStorage {
     }
   }
 
+  /// Cloud equivalent of [_loadUsersRaw]. The password field always
+  /// comes back empty because only its hash is stored — nothing in the
+  /// app reads a password back, it only ever validates one.
+  static Future<Map<String, Map<String, String>>> _loadUsersRawCloud() async {
+    final snapshot = await CloudSync.users.get();
+    return {
+      for (final doc in snapshot.docs)
+        doc.id: {
+          'password': '',
+          'createdAt': (doc.data()['createdAt'] ?? '').toString(),
+        },
+    };
+  }
+
   static Future<void> _persistRaw(Map<String, Map<String, String>> users) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_usersKey, jsonEncode(users));
@@ -94,6 +201,30 @@ class UserStorage {
   /// Registers a new account. Returns `false` if the username is taken.
   static Future<bool> registerUser(String username, String password, {String? createdAt}) async {
     final lowerUser = username.trim().toLowerCase();
+
+    if (CloudSync.enabled) {
+      final salt = CloudSync.newSalt();
+      final doc = CloudSync.users.doc(lowerUser);
+      try {
+        // A transaction is what stops two devices registering the same
+        // username at the same moment.
+        return await FirebaseFirestore.instance.runTransaction((tx) async {
+          final snapshot = await tx.get(doc);
+          if (snapshot.exists) return false;
+          tx.set(doc, {
+            'username': lowerUser,
+            'salt': salt,
+            'passwordHash': CloudSync.hashPassword(password, salt),
+            'createdAt': createdAt ?? DateTime.now().toIso8601String(),
+          });
+          return true;
+        });
+      } catch (e) {
+        debugPrint('CloudSync: registerUser failed ($e).');
+        return false;
+      }
+    }
+
     final users = await _loadUsersRaw();
 
     if (users.containsKey(lowerUser)) {
@@ -116,6 +247,25 @@ class UserStorage {
     String fallbackPassword = 'demo1234',
   }) async {
     final lowerUser = username.trim().toLowerCase();
+
+    if (CloudSync.enabled) {
+      final doc = CloudSync.users.doc(lowerUser);
+      final snapshot = await doc.get();
+      final data = snapshot.data();
+      if (data != null && (data['passwordHash']?.toString().isNotEmpty ?? false)) {
+        await doc.update({'createdAt': createdAt});
+      } else {
+        final salt = CloudSync.newSalt();
+        await doc.set({
+          'username': lowerUser,
+          'salt': salt,
+          'passwordHash': CloudSync.hashPassword(fallbackPassword, salt),
+          'createdAt': createdAt,
+        });
+      }
+      return;
+    }
+
     final users = await _loadUsersRaw();
     final existingPassword = users[lowerUser]?['password'];
     users[lowerUser] = {
@@ -125,6 +275,41 @@ class UserStorage {
       'createdAt': createdAt,
     };
     await _persistRaw(users);
+  }
+
+  /// Writes a whole roster of accounts in one Firestore batch, used by
+  /// the demo seeding so first launch costs a single round trip instead
+  /// of one per account. Existing accounts only get their date updated,
+  /// so a real player's password is never overwritten.
+  static Future<void> setManyAccountCreatedAt(
+    Map<String, String> createdAtByUsername, {
+    String fallbackPassword = 'demo1234',
+  }) async {
+    if (!CloudSync.enabled) {
+      for (final entry in createdAtByUsername.entries) {
+        await setAccountCreatedAt(entry.key, entry.value, fallbackPassword: fallbackPassword);
+      }
+      return;
+    }
+
+    final existing = (await CloudSync.users.get()).docs.map((d) => d.id).toSet();
+    final batch = FirebaseFirestore.instance.batch();
+    createdAtByUsername.forEach((username, createdAt) {
+      final id = CloudSync.userId(username);
+      final doc = CloudSync.users.doc(id);
+      if (existing.contains(id)) {
+        batch.update(doc, {'createdAt': createdAt});
+      } else {
+        final salt = CloudSync.newSalt();
+        batch.set(doc, {
+          'username': id,
+          'salt': salt,
+          'passwordHash': CloudSync.hashPassword(fallbackPassword, salt),
+          'createdAt': createdAt,
+        });
+      }
+    });
+    await batch.commit();
   }
 
   /// FIX: repairs every account whose saved createdAt is missing/empty —
@@ -142,6 +327,21 @@ class UserStorage {
     if (users.isEmpty) return 0;
 
     final keys = users.keys.toList()..sort();
+
+    if (CloudSync.enabled) {
+      final batch = FirebaseFirestore.instance.batch();
+      int repairedInCloud = 0;
+      for (int i = 0; i < keys.length; i++) {
+        if ((users[keys[i]]!['createdAt'] ?? '').isNotEmpty) continue;
+        batch.update(CloudSync.users.doc(keys[i]), {
+          'createdAt': _deterministicCreatedAt(keys[i], i),
+        });
+        repairedInCloud++;
+      }
+      if (repairedInCloud > 0) await batch.commit();
+      return repairedInCloud;
+    }
+
     int repaired = 0;
 
     for (int i = 0; i < keys.length; i++) {
@@ -178,6 +378,19 @@ class UserStorage {
   /// Validates login credentials against the saved accounts.
   static Future<UserLoginResult> validateLogin(String username, String password) async {
     final lowerUser = username.trim().toLowerCase();
+
+    if (CloudSync.enabled) {
+      final snapshot = await CloudSync.users.doc(lowerUser).get();
+      final data = snapshot.data();
+      if (!snapshot.exists || data == null) return UserLoginResult.userNotFound;
+      final salt = (data['salt'] ?? '').toString();
+      final storedHash = (data['passwordHash'] ?? '').toString();
+      if (CloudSync.hashPassword(password, salt) != storedHash) {
+        return UserLoginResult.wrongPassword;
+      }
+      return UserLoginResult.success;
+    }
+
     final users = await _loadUsersRaw();
 
     if (!users.containsKey(lowerUser)) {
@@ -190,19 +403,46 @@ class UserStorage {
   }
 
   static Future<bool> userExists(String username) async {
+    final lowerUser = username.trim().toLowerCase();
+    if (CloudSync.enabled) {
+      return (await CloudSync.users.doc(lowerUser).get()).exists;
+    }
     final users = await _loadUsersRaw();
-    return users.containsKey(username.trim().toLowerCase());
+    return users.containsKey(lowerUser);
   }
 
   /// Deletes a single registered account.
   static Future<void> deleteUser(String username) async {
     final lowerUser = username.trim().toLowerCase();
+
+    if (CloudSync.enabled) {
+      // Wipe the player's scores and progress with the account so no
+      // orphan rows are left behind on the shared leaderboard.
+      final batch = FirebaseFirestore.instance.batch();
+      batch.delete(CloudSync.users.doc(lowerUser));
+      batch.delete(CloudSync.scores.doc(lowerUser));
+      batch.delete(CloudSync.progress.doc(lowerUser));
+      await batch.commit();
+      return;
+    }
+
     final users = await _loadUsersRaw();
     users.remove(lowerUser);
     await _persistRaw(users);
+    await DifficultyScoreStore.removeUser(lowerUser);
+    await DifficultyProgress.removeUser(lowerUser);
   }
 
   static Future<void> clearAllUsers() async {
+    if (CloudSync.enabled) {
+      final snapshot = await CloudSync.users.get();
+      final batch = FirebaseFirestore.instance.batch();
+      for (final doc in snapshot.docs) {
+        batch.delete(doc.reference);
+      }
+      await batch.commit();
+      return;
+    }
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_usersKey);
   }
@@ -276,6 +516,13 @@ class DifficultyProgress {
       'diff_progress_${username.trim().toLowerCase()}';
 
   static Future<Set<String>> getCompleted(String username) async {
+    if (CloudSync.enabled) {
+      final snapshot = await CloudSync.progress.doc(CloudSync.userId(username)).get();
+      final completed = snapshot.data()?['completed'];
+      if (completed is! List) return {};
+      return completed.map((e) => e.toString()).toSet();
+    }
+
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getStringList(_keyFor(username));
     if (raw == null) return {};
@@ -283,11 +530,28 @@ class DifficultyProgress {
   }
 
   static Future<void> markCompleted(String username, String difficulty) async {
+    if (CloudSync.enabled) {
+      await CloudSync.progress.doc(CloudSync.userId(username)).set(
+        {'completed': FieldValue.arrayUnion([difficulty])},
+        SetOptions(merge: true),
+      );
+      return;
+    }
+
     final prefs = await SharedPreferences.getInstance();
     final key = _keyFor(username);
     final current = (prefs.getStringList(key) ?? <String>[]).toSet();
     current.add(difficulty);
     await prefs.setStringList(key, current.toList());
+  }
+
+  static Future<void> removeUser(String username) async {
+    if (CloudSync.enabled) {
+      await CloudSync.progress.doc(CloudSync.userId(username)).delete();
+      return;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_keyFor(username));
   }
 }
 
@@ -304,6 +568,17 @@ class DifficultyScoreStore {
   static const String _key = 'saved_high_scores_by_difficulty';
 
   static Future<Map<String, Map<String, int>>> loadAll() async {
+    if (CloudSync.enabled) {
+      final snapshot = await CloudSync.scores.get();
+      return {
+        for (final doc in snapshot.docs)
+          doc.id: {
+            for (final entry in doc.data().entries)
+              if (entry.value is num) entry.key: (entry.value as num).toInt(),
+          },
+      };
+    }
+
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString(_key);
     if (raw == null || raw.isEmpty) return {};
@@ -328,6 +603,20 @@ class DifficultyScoreStore {
   /// the player's existing best for that category.
   static Future<void> submitScore(String username, String category, int score) async {
     final lowerUser = username.trim().toLowerCase();
+
+    if (CloudSync.enabled) {
+      final doc = CloudSync.scores.doc(lowerUser);
+      // Read and write inside one transaction so two devices finishing a
+      // run at the same time can never clobber each other's best score.
+      await FirebaseFirestore.instance.runTransaction((tx) async {
+        final snapshot = await tx.get(doc);
+        final current = (snapshot.data()?[category] as num?)?.toInt() ?? 0;
+        if (score <= current) return;
+        tx.set(doc, {category: score}, SetOptions(merge: true));
+      });
+      return;
+    }
+
     final data = await loadAll();
     final userScores = data[lowerUser] ?? <String, int>{};
     if (score > (userScores[category] ?? 0)) {
@@ -335,6 +624,19 @@ class DifficultyScoreStore {
       data[lowerUser] = userScores;
       await _saveAll(data);
     }
+  }
+
+  /// Drops every category score for a player, so deleting an account
+  /// never leaves an orphan row behind on the leaderboard.
+  static Future<void> removeUser(String username) async {
+    final lowerUser = username.trim().toLowerCase();
+    if (CloudSync.enabled) {
+      await CloudSync.scores.doc(lowerUser).delete();
+      return;
+    }
+    final data = await loadAll();
+    data.remove(lowerUser);
+    await _saveAll(data);
   }
 
   /// The single best score a player has across every category — used by
@@ -345,12 +647,158 @@ class DifficultyScoreStore {
   }
 
   static Future<void> clearAll() async {
+    if (CloudSync.enabled) {
+      final snapshot = await CloudSync.scores.get();
+      final batch = FirebaseFirestore.instance.batch();
+      for (final doc in snapshot.docs) {
+        batch.delete(doc.reference);
+      }
+      await batch.commit();
+      return;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_key);
+  }
+}
+
+// --- ADMIN-CONFIGURABLE DIFFICULTY SETTINGS ---
+//
+// Per-difficulty game balance (Tom speed, Tom spawn interval, max Toms,
+// target score, points per cheese) editable from the Admin Settings
+// screen. Stored as JSON:
+//   { 'EASY': { 'speed': 50, ... }, 'AVERAGE': {...}, 'HARD': {...} }
+//
+// ENDLESS is not stored: it reuses HARD's values, since it is just HARD
+// continued past its target score.
+class DifficultySettingsStore {
+  static const String _key = 'admin_difficulty_settings';
+
+  static const Map<String, Map<String, num>> _defaults = {
+    'EASY': {
+      'speed': 50,
+      'spawnInterval': 30,
+      'maxToms': 1,
+      'targetScore': 100,
+      'cheesePoints': 10,
+    },
+    'AVERAGE': {
+      'speed': 70,
+      'spawnInterval': 20,
+      'maxToms': 2,
+      'targetScore': 150,
+      'cheesePoints': 10,
+    },
+    'HARD': {
+      'speed': 90,
+      'spawnInterval': 12,
+      'maxToms': 3,
+      'targetScore': 300,
+      'cheesePoints': 10,
+    },
+  };
+
+  /// A fresh, mutable copy of the built-in balance values. A copy is
+  /// handed out every time so callers can never mutate the defaults
+  /// that the fallback logic relies on.
+  static Map<String, Map<String, num>> get defaultSettings => {
+        for (final entry in _defaults.entries)
+          entry.key: Map<String, num>.from(entry.value),
+      };
+
+  /// Stored settings merged over the defaults, so a newly added field
+  /// still resolves for players who saved settings before it existed.
+  static Future<Map<String, Map<String, num>>> loadAll() async {
+    final merged = defaultSettings;
+
+    Map<String, dynamic>? decoded;
+    if (CloudSync.enabled) {
+      decoded = (await CloudSync.config.doc(_key).get()).data();
+      if (decoded == null) return merged;
+    } else {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_key);
+      if (raw == null || raw.isEmpty) return merged;
+      try {
+        decoded = jsonDecode(raw) as Map<String, dynamic>;
+      } catch (_) {
+        return defaultSettings;
+      }
+    }
+
+    try {
+      decoded.forEach((difficulty, values) {
+        if (values is! Map) return;
+        final target = merged[difficulty] ?? <String, num>{};
+        values.forEach((field, value) {
+          if (value is num) target['$field'] = value;
+        });
+        merged[difficulty] = target;
+      });
+    } catch (_) {
+      return defaultSettings;
+    }
+    return merged;
+  }
+
+  /// Saves the admin's balance values. With the cloud enabled this is a
+  /// single shared document, so an admin editing the game on one machine
+  /// changes it for every player.
+  static Future<void> saveAll(Map<String, Map<String, num>> settings) async {
+    if (CloudSync.enabled) {
+      await CloudSync.config.doc(_key).set(settings);
+      return;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_key, jsonEncode(settings));
+  }
+
+  static Future<void> resetToDefault() async {
+    if (CloudSync.enabled) {
+      await CloudSync.config.doc(_key).delete();
+      return;
+    }
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_key);
   }
 }
 
 // --- REPORT GENERATION ---
+
+/// Registration window the exported user-log report is limited to.
+enum ReportTimeframe { allTime, daily, weekly, monthly, yearly }
+
+extension ReportTimeframeExtension on ReportTimeframe {
+  /// Oldest registration date still included, or null for [allTime].
+  DateTime? startFrom(DateTime now) {
+    switch (this) {
+      case ReportTimeframe.daily:
+        return now.subtract(const Duration(days: 1));
+      case ReportTimeframe.weekly:
+        return now.subtract(const Duration(days: 7));
+      case ReportTimeframe.monthly:
+        return now.subtract(const Duration(days: 30));
+      case ReportTimeframe.yearly:
+        return now.subtract(const Duration(days: 365));
+      case ReportTimeframe.allTime:
+        return null;
+    }
+  }
+
+  String get label {
+    switch (this) {
+      case ReportTimeframe.daily:
+        return 'Last 24 Hours';
+      case ReportTimeframe.weekly:
+        return 'Last 7 Days';
+      case ReportTimeframe.monthly:
+        return 'Last 30 Days';
+      case ReportTimeframe.yearly:
+        return 'Last 365 Days';
+      case ReportTimeframe.allTime:
+        return 'All Time';
+    }
+  }
+}
 
 /// One line of the exported user-log report. Carries the player's best
 /// score in EVERY category (EASY / AVERAGE / HARD / ENDLESS) so the
@@ -388,12 +836,24 @@ class AccountLogEntry {
 class ReportService {
   static Future<void> downloadUserLogsReport({
     required List<AccountLogEntry> accounts,
+    ReportTimeframe timeframe = ReportTimeframe.allTime,
   }) async {
     final pdf = pw.Document();
 
+    // Only accounts registered inside the selected window. Entries with
+    // an unusable registration date are kept only in the All Time
+    // report, since they cannot be placed in any window.
+    final cutoff = timeframe.startFrom(DateTime.now());
+    final filtered = cutoff == null
+        ? List<AccountLogEntry>.from(accounts)
+        : accounts.where((a) {
+            final created = DateTime.tryParse(a.createdAtIso);
+            return created != null && !created.isBefore(cutoff);
+          }).toList();
+
     // Oldest registration first — this is what makes "the first player
     // who registered" visible at the top of the list.
-    final ordered = List<AccountLogEntry>.from(accounts)
+    final ordered = filtered
       ..sort((a, b) => compareByCreatedAtAsc(a.createdAtIso, b.createdAtIso));
 
     AccountLogEntry? firstPlayer;
@@ -421,7 +881,7 @@ class ReportService {
           pw.SizedBox(height: 4),
           top.isEmpty
               ? pw.Text('No scores recorded yet.', style: const pw.TextStyle(fontSize: 9))
-              : pw.Table.fromTextArray(
+              : pw.TableHelper.fromTextArray(
                   headers: const ['Rank', 'Username', 'Score'],
                   data: List.generate(
                     top.length,
@@ -454,6 +914,7 @@ class ReportService {
             style: pw.TextStyle(fontSize: 13, fontStyle: pw.FontStyle.italic),
           ),
           pw.SizedBox(height: 4),
+          pw.Text('Timeframe: ${timeframe.label}'),
           pw.Text('Generated: ${DateTime.now().toString().split('.').first}'),
           pw.Divider(),
           pw.SizedBox(height: 12),
@@ -505,8 +966,8 @@ class ReportService {
           ),
           pw.SizedBox(height: 8),
           ordered.isEmpty
-              ? pw.Text('No registered accounts.')
-              : pw.Table.fromTextArray(
+              ? pw.Text('No registered accounts in this timeframe.')
+              : pw.TableHelper.fromTextArray(
                   headers: ['#', 'Username', 'Registered At', 'Easy', 'Average', 'Hard', 'Endless'],
                   data: List.generate(
                     ordered.length,
@@ -552,7 +1013,7 @@ class ReportService {
 
     await Printing.sharePdf(
       bytes: bytes,
-      filename: 'user_logs_report.pdf',
+      filename: 'user_logs_report_${timeframe.name}.pdf',
     );
   }
 }
@@ -596,6 +1057,11 @@ class AppTranslations {
   static const Map<String, Map<String, String>> _keys = {
     'en': {
       'login_title': 'PLAYER LOGIN',
+      'p2_login_title': 'PLAYER 2 LOGIN',
+      'p2_login_hint': 'Player 2 signs in so their score is saved to their own account.',
+      'cloud_online': 'ONLINE — accounts shared across devices',
+      'cloud_offline': 'OFFLINE — accounts saved on this device only',
+      'p2_same_account': 'Player 2 must use a different account.',
       'register_title': 'REGISTER PLAYER',
       'username': 'Unique Username',
       'password': 'Password',
@@ -684,9 +1150,34 @@ class AppTranslations {
       'endless_badge': 'ENDLESS',
       'endless_unlocked_msg': 'HARD cleared! The chase never ends now — survive as long as you can!',
       'player_out': 'OUT!',
+      'admin_settings': 'GAME SETTINGS',
+      'difficulty_settings_title': 'DIFFICULTY SETTINGS',
+      'speed_label': 'Tom Speed',
+      'spawn_interval_label': 'Tom Spawn Interval (s)',
+      'max_toms_label': 'Max Toms',
+      'target_score_label': 'Target Score',
+      'cheese_points_label': 'Points per Cheese',
+      'save_settings': 'SAVE SETTINGS',
+      'settings_saved': 'Settings saved. They apply on the next run.',
+      'settings_reset': 'Settings restored to defaults.',
+      'invalid_number': 'Please enter a valid non-negative number in every field.',
+      'reset_default': 'Reset to Default',
+      'confirm_reset_title': 'Reset Settings?',
+      'confirm_reset_msg': 'This restores the default balance for every difficulty.',
+      'export_timeframe_label': 'Report Timeframe',
+      'timeframe_all': 'ALL TIME',
+      'timeframe_daily': 'DAILY',
+      'timeframe_weekly': 'WEEKLY',
+      'timeframe_monthly': 'MONTHLY',
+      'timeframe_yearly': 'YEARLY',
     },
     'tl': {
       'login_title': 'PLAYER LOGIN',
+      'p2_login_title': 'PLAYER 2 LOGIN',
+      'p2_login_hint': 'Mag-log in si Player 2 para masave ang score sa sarili niyang account.',
+      'cloud_online': 'ONLINE — shared ang accounts sa lahat ng device',
+      'cloud_offline': 'OFFLINE — nasa device na ito lang ang accounts',
+      'p2_same_account': 'Kailangang ibang account ang gamitin ni Player 2.',
       'register_title': 'MAG-REGISTER NG PLAYER',
       'username': 'Tanging Username',
       'password': 'Password',
@@ -778,6 +1269,11 @@ class AppTranslations {
     },
     'zh': {
       'login_title': '玩家登录',
+      'p2_login_title': '玩家2登录',
+      'p2_login_hint': '玩家2登录后，分数会保存到自己的账号。',
+      'cloud_online': '在线 — 账号在所有设备间共享',
+      'cloud_offline': '离线 — 账号仅保存在本设备',
+      'p2_same_account': '玩家2必须使用不同的账号。',
       'register_title': '注册玩家',
       'username': '用户名',
       'password': '密码',
@@ -850,6 +1346,11 @@ class AppTranslations {
     },
     'es': {
       'login_title': 'INICIAR SESIÓN',
+      'p2_login_title': 'INICIO DE SESIÓN JUGADOR 2',
+      'p2_login_hint': 'El jugador 2 inicia sesión para guardar su puntaje en su propia cuenta.',
+      'cloud_online': 'EN LÍNEA — cuentas compartidas entre dispositivos',
+      'cloud_offline': 'SIN CONEXIÓN — cuentas solo en este dispositivo',
+      'p2_same_account': 'El jugador 2 debe usar otra cuenta.',
       'register_title': 'REGISTRAR JUGADOR',
       'username': 'Nombre de Usuario',
       'password': 'Contraseña',
@@ -922,6 +1423,11 @@ class AppTranslations {
     },
     'ja': {
       'login_title': 'プレイヤーログイン',
+      'p2_login_title': 'プレイヤー2 ログイン',
+      'p2_login_hint': 'プレイヤー2がログインすると、スコアは本人のアカウントに保存されます。',
+      'cloud_online': 'オンライン — アカウントは全端末で共有',
+      'cloud_offline': 'オフライン — アカウントはこの端末のみ',
+      'p2_same_account': 'プレイヤー2は別のアカウントを使用してください。',
       'register_title': '新規登録',
       'username': 'ユーザー名',
       'password': 'パスワード',
@@ -1005,7 +1511,16 @@ class AppTranslations {
 
 // --- ADMIN ACCESS ---
 class AdminConfig {
+  // WARNING: this password ships inside the compiled app and is readable
+  // by anyone who inspects the bundle. It is only a soft lock for a local
+  // demo — move admin verification to Firebase Auth custom claims and
+  // Firestore rules before letting anyone outside the class play.
   static const String adminPassword = 'admin1234';
+
+  /// Whether the ~120 fake demo accounts may be written into the shared
+  /// cloud roster. Off by default: they all use the same throwaway
+  /// password and would pollute the real leaderboard and PDF report.
+  static const bool seedDemoDataInCloud = false;
 }
 
 // --- DEMO DATA SEEDING ---
@@ -1125,20 +1640,33 @@ int _maxScoreForCategory(String category) {
 ///    above HARD's 300-point target, since that mode only exists by
 ///    continuing the chase past that point.
 Future<void> seedDemoDataIfNeeded() async {
-  final prefs = await SharedPreferences.getInstance();
   const seededFlagKey = 'demo_data_seeded_v6';
 
-  if (prefs.getBool(seededFlagKey) == true) {
-    return;
-  }
+  // Demo accounts all share one throwaway password, so they must never
+  // be written into a shared cloud roster that real players log in to.
+  if (CloudSync.enabled && !AdminConfig.seedDemoDataInCloud) return;
 
-  // Wipe any older-format seed so stale/out-of-range scores from a
-  // previous version never linger alongside the new ones.
-  await prefs.remove('demo_data_seeded_v5');
-  await prefs.remove('demo_data_seeded_v4');
-  await prefs.remove('demo_data_seeded_v3');
-  await prefs.remove('demo_data_seeded_v2');
-  await prefs.remove('demo_data_seeded');
+  // With the cloud enabled the roster is shared, so the "already seeded"
+  // marker has to live in Firestore too — otherwise every new device
+  // would re-seed the same demo accounts.
+  SharedPreferences? prefs;
+  if (CloudSync.enabled) {
+    final marker = await CloudSync.config.doc('seed').get();
+    if (marker.data()?['version'] == seededFlagKey) return;
+  } else {
+    prefs = await SharedPreferences.getInstance();
+    if (prefs.getBool(seededFlagKey) == true) {
+      return;
+    }
+
+    // Wipe any older-format seed so stale/out-of-range scores from a
+    // previous version never linger alongside the new ones.
+    await prefs.remove('demo_data_seeded_v5');
+    await prefs.remove('demo_data_seeded_v4');
+    await prefs.remove('demo_data_seeded_v3');
+    await prefs.remove('demo_data_seeded_v2');
+    await prefs.remove('demo_data_seeded');
+  }
 
   final allDemoAccounts = <String, int>{
     ..._demoScores,
@@ -1146,12 +1674,10 @@ Future<void> seedDemoDataIfNeeded() async {
   };
 
   final dateRand = Random(5678); // fixed seed so dates stay stable across runs
-  for (final username in allDemoAccounts.keys) {
-    await UserStorage.setAccountCreatedAt(
-      username,
-      _randomActivityTimestamp(dateRand),
-    );
-  }
+  await UserStorage.setManyAccountCreatedAt({
+    for (final username in allDemoAccounts.keys)
+      username: _randomActivityTimestamp(dateRand),
+  });
 
   // Turn each demo account's arbitrary base number into a proportional
   // rank (0.0 - 1.0 against the highest base in the roster), then scale
@@ -1183,13 +1709,27 @@ Future<void> seedDemoDataIfNeeded() async {
     }
     categorized[entry.key] = scores;
   }
-  await prefs.setString('saved_high_scores_by_difficulty', jsonEncode(categorized));
 
+  if (CloudSync.enabled) {
+    final batch = FirebaseFirestore.instance.batch();
+    categorized.forEach((username, scores) {
+      batch.set(CloudSync.scores.doc(username), scores, SetOptions(merge: true));
+    });
+    batch.set(CloudSync.config.doc('seed'), {'version': seededFlagKey});
+    await batch.commit();
+    return;
+  }
+
+  await prefs!.setString('saved_high_scores_by_difficulty', jsonEncode(categorized));
   await prefs.setBool(seededFlagKey, true);
 }
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Connect to Firestore before anything reads accounts or scores. If
+  // Firebase is not configured or unreachable this is a no-op and the
+  // game runs on on-device storage exactly as before.
+  await CloudSync.init();
   runApp(const MaterialApp(
     debugShowCheckedModeBanner: false,
     home: GameApp(),
@@ -1364,6 +1904,10 @@ bool rectHitsWall(Rect rect) {
 class TomAndJerryGame extends FlameGame
     with HasCollisionDetection, HasKeyboardHandlerComponents {
   String playerName = 'Player 1';
+  /// Account the second player signed in with before a co-op run. Empty
+  /// in single player, and their score is only ever saved under this
+  /// name so co-op runs never share one anonymous leaderboard row.
+  String playerTwoName = '';
   String difficulty = 'EASY';
   bool isTwoPlayerMode = false;
   final ValueNotifier<bool> isDarkModeNotifier = ValueNotifier<bool>(true);
@@ -1630,6 +2174,19 @@ class TomAndJerryGame extends FlameGame
     FlameAudio.bgm.stop();
     world.removeAll(world.children.toList());
     toms.clear();
+    jerry1 = null;
+    jerry2 = null;
+    playerName = 'Player 1';
+    playerTwoName = '';
+    difficulty = 'EASY';
+    isTwoPlayerMode = false;
+    _isEndlessSelectedMode = false;
+    isEndlessNotifier.value = false;
+    p1ScoreNotifier.value = 0;
+    p2ScoreNotifier.value = 0;
+    p1CaughtNotifier.value = false;
+    p2CaughtNotifier.value = false;
+    _levelCompleteTriggered = false;
     overlays.clear();
     overlays.add('AuthMenu');
     resumeEngine();
@@ -1752,7 +2309,6 @@ class TomAndJerryGame extends FlameGame
     world.add(firstTom);
 
     focusNode?.requestFocus();
-    HardwareKeyboard.instance.clearState();
 
     final mazeWidthPx = mazeLayout[0].length * cellSize;
     final mazeHeightPx = mazeLayout.length * cellSize;
@@ -1824,6 +2380,25 @@ class TomAndJerryGame extends FlameGame
   void _spawnExtraTom() {
     final emptyCells = _getEmptyCells();
     emptyCells.shuffle(Random());
+
+    // Never drop a new Tom right next to a player — that reads as an
+    // unfair instant catch. Keep a few cells of breathing room, falling
+    // back to any free cell only if the maze is too crowded.
+    const minCellsFromPlayer = 4.0;
+    final playerCells = <Vector2>[
+      if (jerry1 != null) jerry1!.position / cellSize,
+      if (jerry2 != null) jerry2!.position / cellSize,
+    ];
+    final safeCells = emptyCells
+        .where((cell) => playerCells
+            .every((player) => cell.distanceTo(player) >= minCellsFromPlayer))
+        .toList();
+    if (safeCells.isNotEmpty) {
+      emptyCells
+        ..clear()
+        ..addAll(safeCells);
+    }
+
     if (emptyCells.isEmpty) return;
 
     final speed = _speedForDifficulty(difficulty);
@@ -1882,7 +2457,11 @@ class TomAndJerryGame extends FlameGame
   void _checkLevelComplete() {
     if (_levelCompleteTriggered) return;
     final total = p1ScoreNotifier.value + (isTwoPlayerMode ? p2ScoreNotifier.value : 0);
-    if (total >= _targetScoreForDifficulty(difficulty)) {
+    // Two players collect cheese twice as fast, so co-op has to reach
+    // twice the target before the level counts as cleared.
+    final target =
+        _targetScoreForDifficulty(difficulty) * (isTwoPlayerMode ? 2 : 1);
+    if (total >= target) {
       if (difficulty == 'HARD') {
         // Reaching HARD's target doesn't pause the game anymore — it
         // unlocks endless play instead, and the chase just keeps going.
@@ -1956,9 +2535,12 @@ class TomAndJerryGame extends FlameGame
 
     await DifficultyScoreStore.submitScore(playerName, category, p1ScoreNotifier.value);
 
-    if (isTwoPlayerMode) {
-      const p2Name = 'player 2 (co-op)';
-      await DifficultyScoreStore.submitScore(p2Name, category, p2ScoreNotifier.value);
+    if (isTwoPlayerMode && playerTwoName.isNotEmpty) {
+      await DifficultyScoreStore.submitScore(
+        playerTwoName,
+        category,
+        p2ScoreNotifier.value,
+      );
     }
   }
 
@@ -3643,7 +4225,35 @@ class _AuthOverlayState extends State<AuthOverlay> {
                       style: TextStyle(color: textColor, fontSize: 28, fontWeight: FontWeight.bold),
                     ),
                   ),
-                  const SizedBox(height: 22),
+                  const SizedBox(height: 8),
+                  // Makes it obvious whether this device is talking to the
+                  // shared roster or only to its own local storage.
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        CloudSync.enabled ? Icons.cloud_done : Icons.cloud_off,
+                        size: 16,
+                        color: CloudSync.enabled ? AppColors.brightCyan : Colors.orangeAccent,
+                      ),
+                      const SizedBox(width: 6),
+                      Flexible(
+                        child: Text(
+                          widget.game.tr(
+                            CloudSync.enabled ? 'cloud_online' : 'cloud_offline',
+                          ),
+                          style: TextStyle(
+                            color: CloudSync.enabled
+                                ? AppColors.brightCyan
+                                : Colors.orangeAccent,
+                            fontSize: 12,
+                          ),
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
                   TextField(
                     controller: _usernameController,
                     enabled: !_isProcessing,
@@ -4173,9 +4783,140 @@ class HowToPlayOverlay extends StatelessWidget {
   }
 }
 
+class _PlayerTwoLoginDialog extends StatefulWidget {
+  final TomAndJerryGame game;
+  const _PlayerTwoLoginDialog({required this.game});
+
+  @override
+  State<_PlayerTwoLoginDialog> createState() => _PlayerTwoLoginDialogState();
+}
+
+class _PlayerTwoLoginDialogState extends State<_PlayerTwoLoginDialog> {
+  final _usernameController = TextEditingController();
+  final _passwordController = TextEditingController();
+  String _messageKey = '';
+  bool _isProcessing = false;
+
+  @override
+  void dispose() {
+    _usernameController.dispose();
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (_isProcessing) return;
+    final username = _usernameController.text.trim();
+    final password = _passwordController.text.trim();
+
+    if (username.isEmpty || password.isEmpty) {
+      setState(() => _messageKey = 'fill_fields');
+      return;
+    }
+    if (username.toLowerCase() == widget.game.playerName.toLowerCase()) {
+      setState(() => _messageKey = 'p2_same_account');
+      return;
+    }
+
+    setState(() {
+      _isProcessing = true;
+      _messageKey = '';
+    });
+
+    final result = await UserStorage.validateLogin(username, password);
+    if (!mounted) return;
+
+    if (result == UserLoginResult.success) {
+      Navigator.of(context).pop(username);
+      return;
+    }
+
+    _passwordController.clear();
+    setState(() {
+      _isProcessing = false;
+      _messageKey = result == UserLoginResult.userNotFound
+          ? 'user_not_found'
+          : 'wrong_password';
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final game = widget.game;
+    final isDark = game.isDarkModeNotifier.value;
+    final textColor = isDark ? AppColors.softWhite : AppColors.lightText;
+
+    return AlertDialog(
+      backgroundColor: isDark ? AppColors.deepBlue : Colors.white,
+      title: Text(
+        game.tr('p2_login_title'),
+        style: TextStyle(color: textColor, fontWeight: FontWeight.bold),
+      ),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            game.tr('p2_login_hint'),
+            style: TextStyle(color: textColor.withValues(alpha: 0.8), fontSize: 13),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _usernameController,
+            enabled: !_isProcessing,
+            style: TextStyle(color: textColor),
+            decoration: InputDecoration(labelText: game.tr('username')),
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _passwordController,
+            enabled: !_isProcessing,
+            obscureText: true,
+            style: TextStyle(color: textColor),
+            decoration: InputDecoration(labelText: game.tr('password')),
+            onSubmitted: (_) => _submit(),
+          ),
+          if (_messageKey.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Text(
+              game.tr(_messageKey),
+              style: const TextStyle(color: Colors.redAccent, fontSize: 13),
+            ),
+          ],
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: _isProcessing ? null : () => Navigator.of(context).pop(),
+          child: Text(game.tr('back')),
+        ),
+        ElevatedButton(
+          onPressed: _isProcessing ? null : _submit,
+          child: Text(game.tr('login_btn')),
+        ),
+      ],
+    );
+  }
+}
+
 class ModeSelectOverlay extends StatelessWidget {
   final TomAndJerryGame game;
   const ModeSelectOverlay({super.key, required this.game});
+
+  /// Co-op needs a second account: player 2 signs in first so their run
+  /// is saved under their own name instead of a shared anonymous row.
+  Future<void> _startTwoPlayer(BuildContext context) async {
+    final signedIn = await showDialog<String>(
+      context: context,
+      builder: (_) => _PlayerTwoLoginDialog(game: game),
+    );
+    if (signedIn == null || signedIn.isEmpty) return;
+
+    game.isTwoPlayerMode = true;
+    game.playerTwoName = signedIn;
+    game.overlays.remove('ModeSelect');
+    game.overlays.add('Difficulty');
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -4202,6 +4943,7 @@ class ModeSelectOverlay extends StatelessWidget {
                   textColor: isDark ? AppColors.darkNavy : Colors.white,
                   onTap: () {
                     game.isTwoPlayerMode = false;
+                    game.playerTwoName = '';
                     game.overlays.remove('ModeSelect');
                     game.overlays.add('Difficulty');
                   },
@@ -4211,11 +4953,7 @@ class ModeSelectOverlay extends StatelessWidget {
                   label: game.tr('mode_2p'),
                   color: AppColors.royalBlue,
                   textColor: Colors.white,
-                  onTap: () {
-                    game.isTwoPlayerMode = true;
-                    game.overlays.remove('ModeSelect');
-                    game.overlays.add('Difficulty');
-                  },
+                  onTap: () => _startTwoPlayer(context),
                 ),
                 const SizedBox(height: 8),
                 TextButton(
@@ -4573,7 +5311,7 @@ class _AdminDashboardOverlayState extends State<AdminDashboardOverlay> {
 
   double get _avgScore {
     if (_highScores.isEmpty) return 0;
-    final total = _highScores.values.fold<int>(0, (sum, v) => sum + v);
+    final total = _highScores.values.fold<int>(0, (running, v) => running + v);
     return total / _highScores.length;
   }
 
