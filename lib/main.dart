@@ -17,6 +17,7 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+
 // =====================================================================
 // GLOBAL ANIMATION CLOCK
 // =====================================================================
@@ -351,121 +352,7 @@ class DifficultyScoreStore {
   }
 }
 
-// --- ADMIN-CONFIGURABLE DIFFICULTY SETTINGS ---
-//
-// Per-difficulty game balance (Tom speed, Tom spawn interval, max Toms,
-// target score, points per cheese) editable from the Admin Settings
-// screen. Stored as JSON:
-//   { 'EASY': { 'speed': 50, ... }, 'AVERAGE': {...}, 'HARD': {...} }
-//
-// ENDLESS is not stored: it reuses HARD's values, since it is just HARD
-// continued past its target score.
-class DifficultySettingsStore {
-  static const String _key = 'admin_difficulty_settings';
-
-  static const Map<String, Map<String, num>> _defaults = {
-    'EASY': {
-      'speed': 50,
-      'spawnInterval': 30,
-      'maxToms': 1,
-      'targetScore': 100,
-      'cheesePoints': 10,
-    },
-    'AVERAGE': {
-      'speed': 70,
-      'spawnInterval': 20,
-      'maxToms': 2,
-      'targetScore': 150,
-      'cheesePoints': 10,
-    },
-    'HARD': {
-      'speed': 90,
-      'spawnInterval': 12,
-      'maxToms': 3,
-      'targetScore': 300,
-      'cheesePoints': 10,
-    },
-  };
-
-  /// A fresh, mutable copy of the built-in balance values. A copy is
-  /// handed out every time so callers can never mutate the defaults
-  /// that the fallback logic relies on.
-  static Map<String, Map<String, num>> get defaultSettings => {
-        for (final entry in _defaults.entries)
-          entry.key: Map<String, num>.from(entry.value),
-      };
-
-  /// Stored settings merged over the defaults, so a newly added field
-  /// still resolves for players who saved settings before it existed.
-  static Future<Map<String, Map<String, num>>> loadAll() async {
-    final merged = defaultSettings;
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_key);
-    if (raw == null || raw.isEmpty) return merged;
-    try {
-      final decoded = jsonDecode(raw) as Map<String, dynamic>;
-      decoded.forEach((difficulty, values) {
-        if (values is! Map) return;
-        final target = merged[difficulty] ?? <String, num>{};
-        values.forEach((field, value) {
-          if (value is num) target['$field'] = value;
-        });
-        merged[difficulty] = target;
-      });
-    } catch (_) {
-      return defaultSettings;
-    }
-    return merged;
-  }
-
-  static Future<void> saveAll(Map<String, Map<String, num>> settings) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_key, jsonEncode(settings));
-  }
-
-  static Future<void> resetToDefault() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_key);
-  }
-}
-
 // --- REPORT GENERATION ---
-
-/// Registration window the exported user-log report is limited to.
-enum ReportTimeframe { allTime, daily, weekly, monthly, yearly }
-
-extension ReportTimeframeExtension on ReportTimeframe {
-  /// Oldest registration date still included, or null for [allTime].
-  DateTime? startFrom(DateTime now) {
-    switch (this) {
-      case ReportTimeframe.daily:
-        return now.subtract(const Duration(days: 1));
-      case ReportTimeframe.weekly:
-        return now.subtract(const Duration(days: 7));
-      case ReportTimeframe.monthly:
-        return now.subtract(const Duration(days: 30));
-      case ReportTimeframe.yearly:
-        return now.subtract(const Duration(days: 365));
-      case ReportTimeframe.allTime:
-        return null;
-    }
-  }
-
-  String get label {
-    switch (this) {
-      case ReportTimeframe.daily:
-        return 'Last 24 Hours';
-      case ReportTimeframe.weekly:
-        return 'Last 7 Days';
-      case ReportTimeframe.monthly:
-        return 'Last 30 Days';
-      case ReportTimeframe.yearly:
-        return 'Last 365 Days';
-      case ReportTimeframe.allTime:
-        return 'All Time';
-    }
-  }
-}
 
 /// One line of the exported user-log report. Carries the player's best
 /// score in EVERY category (EASY / AVERAGE / HARD / ENDLESS) so the
@@ -503,24 +390,12 @@ class AccountLogEntry {
 class ReportService {
   static Future<void> downloadUserLogsReport({
     required List<AccountLogEntry> accounts,
-    ReportTimeframe timeframe = ReportTimeframe.allTime,
   }) async {
     final pdf = pw.Document();
 
-    // Only accounts registered inside the selected window. Entries with
-    // an unusable registration date are kept only in the All Time
-    // report, since they cannot be placed in any window.
-    final cutoff = timeframe.startFrom(DateTime.now());
-    final filtered = cutoff == null
-        ? List<AccountLogEntry>.from(accounts)
-        : accounts.where((a) {
-            final created = DateTime.tryParse(a.createdAtIso);
-            return created != null && !created.isBefore(cutoff);
-          }).toList();
-
     // Oldest registration first — this is what makes "the first player
     // who registered" visible at the top of the list.
-    final ordered = filtered
+    final ordered = List<AccountLogEntry>.from(accounts)
       ..sort((a, b) => compareByCreatedAtAsc(a.createdAtIso, b.createdAtIso));
 
     AccountLogEntry? firstPlayer;
@@ -548,7 +423,7 @@ class ReportService {
           pw.SizedBox(height: 4),
           top.isEmpty
               ? pw.Text('No scores recorded yet.', style: const pw.TextStyle(fontSize: 9))
-              : pw.TableHelper.fromTextArray(
+              : pw.Table.fromTextArray(
                   headers: const ['Rank', 'Username', 'Score'],
                   data: List.generate(
                     top.length,
@@ -581,7 +456,6 @@ class ReportService {
             style: pw.TextStyle(fontSize: 13, fontStyle: pw.FontStyle.italic),
           ),
           pw.SizedBox(height: 4),
-          pw.Text('Timeframe: ${timeframe.label}'),
           pw.Text('Generated: ${DateTime.now().toString().split('.').first}'),
           pw.Divider(),
           pw.SizedBox(height: 12),
@@ -633,8 +507,8 @@ class ReportService {
           ),
           pw.SizedBox(height: 8),
           ordered.isEmpty
-              ? pw.Text('No registered accounts in this timeframe.')
-              : pw.TableHelper.fromTextArray(
+              ? pw.Text('No registered accounts.')
+              : pw.Table.fromTextArray(
                   headers: ['#', 'Username', 'Registered At', 'Easy', 'Average', 'Hard', 'Endless'],
                   data: List.generate(
                     ordered.length,
@@ -680,7 +554,7 @@ class ReportService {
 
     await Printing.sharePdf(
       bytes: bytes,
-      filename: 'user_logs_report_${timeframe.name}.pdf',
+      filename: 'user_logs_report.pdf',
     );
   }
 }
@@ -812,26 +686,6 @@ class AppTranslations {
       'endless_badge': 'ENDLESS',
       'endless_unlocked_msg': 'HARD cleared! The chase never ends now — survive as long as you can!',
       'player_out': 'OUT!',
-      'admin_settings': 'GAME SETTINGS',
-      'difficulty_settings_title': 'DIFFICULTY SETTINGS',
-      'speed_label': 'Tom Speed',
-      'spawn_interval_label': 'Tom Spawn Interval (s)',
-      'max_toms_label': 'Max Toms',
-      'target_score_label': 'Target Score',
-      'cheese_points_label': 'Points per Cheese',
-      'save_settings': 'SAVE SETTINGS',
-      'settings_saved': 'Settings saved. They apply on the next run.',
-      'settings_reset': 'Settings restored to defaults.',
-      'invalid_number': 'Please enter a valid non-negative number in every field.',
-      'reset_default': 'Reset to Default',
-      'confirm_reset_title': 'Reset Settings?',
-      'confirm_reset_msg': 'This restores the default balance for every difficulty.',
-      'export_timeframe_label': 'Report Timeframe',
-      'timeframe_all': 'ALL TIME',
-      'timeframe_daily': 'DAILY',
-      'timeframe_weekly': 'WEEKLY',
-      'timeframe_monthly': 'MONTHLY',
-      'timeframe_yearly': 'YEARLY',
     },
     'tl': {
       'login_title': 'PLAYER LOGIN',
@@ -1372,26 +1226,26 @@ class _LobbyScreenState extends State<LobbyScreen> {
   final TextEditingController _roomController = TextEditingController();
   final MultiplayerService _service = MultiplayerService();
 
-void _handleCreateRoom() async {
-  String roomId = _roomController.text.trim();
-  if (roomId.isNotEmpty) {
-    await _service.createRoom(roomId, 'tom');
+  void _handleCreateRoom() async {
+    String roomId = _roomController.text.trim();
+    if (roomId.isNotEmpty) {
+      await _service.createRoom(roomId, 'tom');
 
-    if (!mounted) return;
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (context) => WaitingScreen(roomId: roomId),
-      ),
-    );
-  }
-}
+      if (!mounted) return;
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (context) => WaitingScreen(roomId: roomId),
+        ),
+      );
+    }
   }
 
   void _handleJoinRoom() async {
     String roomId = _roomController.text.trim();
     if (roomId.isNotEmpty) {
       bool joined = await _service.joinRoom(roomId, 'jerry');
+      if (!mounted) return;
       if (joined) {
         _navigateToGame();
       } else {
@@ -1405,8 +1259,20 @@ void _handleCreateRoom() async {
   void _navigateToGame() {
     Navigator.push(
       context,
-      MaterialPageRoute(builder: (context) => const GameApp()),
+      MaterialPageRoute(
+        builder: (context) => const GameApp(
+          startInGame: true,
+          startTwoPlayer: true,
+          playerName: 'Jerry',
+        ),
+      ),
     );
+  }
+
+  @override
+  void dispose() {
+    _roomController.dispose();
+    super.dispose();
   }
 
   @override
@@ -1478,12 +1344,28 @@ void main() async {
 
   runApp(const MaterialApp(
     debugShowCheckedModeBanner: false,
-    home: const GameApp(),
+    home: GameApp(),
   ));
 }
 
+/// Root game widget. Normally boots straight into the AuthMenu overlay.
+///
+/// When reached from the multiplayer Lobby/Waiting flow, [startInGame]
+/// (plus [startTwoPlayer] and [playerName]) skips AuthMenu / MainMenu /
+/// ModeSelect / Difficulty entirely and drops both players directly into
+/// a running co-op match — see [_GameAppState.initState] and
+/// [TomAndJerryGame.onLoad].
 class GameApp extends StatefulWidget {
-  const GameApp({super.key});
+  final bool startInGame;
+  final bool startTwoPlayer;
+  final String? playerName;
+
+  const GameApp({
+    super.key,
+    this.startInGame = false,
+    this.startTwoPlayer = false,
+    this.playerName,
+  });
 
   @override
   State<GameApp> createState() => _GameAppState();
@@ -1499,6 +1381,17 @@ class _GameAppState extends State<GameApp> {
     super.initState();
     game = TomAndJerryGame();
     game.focusNode = _gameFocusNode;
+
+    if (widget.startInGame) {
+      // Multiplayer entry point: bypass AuthMenu/MainMenu/ModeSelect/
+      // Difficulty and jump straight into a running match once the game
+      // finishes loading (see TomAndJerryGame.onLoad).
+      game.isTwoPlayerMode = widget.startTwoPlayer;
+      game.pendingAutoStart = true;
+      if (widget.playerName != null && widget.playerName!.trim().isNotEmpty) {
+        game.playerName = widget.playerName!.trim();
+      }
+    }
     // FIX: built once here (instead of inline in build()) so its identity
     // never changes across rebuilds — GameWidget treats a new map instance
     // as a fresh overlay configuration, which was resetting the active
@@ -1546,7 +1439,7 @@ class _GameAppState extends State<GameApp> {
         focusNode: _gameFocusNode,
         autofocus: true,
         overlayBuilderMap: _overlayBuilderMap,
-        initialActiveOverlays: const ['AuthMenu'],
+        initialActiveOverlays: widget.startInGame ? const [] : const ['AuthMenu'],
       ),
     );
   }
@@ -1652,6 +1545,13 @@ class TomAndJerryGame extends FlameGame
   String playerName = 'Player 1';
   String difficulty = 'EASY';
   bool isTwoPlayerMode = false;
+
+  // Set by GameApp when this game is reached via the multiplayer
+  // Lobby/Waiting flow instead of AuthMenu. When true, onLoad() calls
+  // startGame() itself once loading finishes, so play begins immediately
+  // on EASY instead of waiting for the player to click through
+  // MainMenu -> ModeSelect -> Difficulty.
+  bool pendingAutoStart = false;
   final ValueNotifier<bool> isDarkModeNotifier = ValueNotifier<bool>(true);
   final ValueNotifier<AppLanguage> languageNotifier = ValueNotifier<AppLanguage>(AppLanguage.english);
 
@@ -1771,6 +1671,15 @@ class TomAndJerryGame extends FlameGame
       'caught.wav',
       'click.wav',
     ]);
+
+    // Multiplayer lobby entry point: skip straight into a running match
+    // instead of showing AuthMenu. Done last, after every asset/setting
+    // above has finished loading, since startGame() builds the maze and
+    // needs the world/camera to already be ready.
+    if (pendingAutoStart) {
+      pendingAutoStart = false;
+      startGame(playerName, 'EASY');
+    }
   }
 
   @override
@@ -2038,7 +1947,6 @@ class TomAndJerryGame extends FlameGame
     world.add(firstTom);
 
     focusNode?.requestFocus();
-    // ignore: invalid_use_of_visible_for_testing_member
     HardwareKeyboard.instance.clearState();
 
     final mazeWidthPx = mazeLayout[0].length * cellSize;
@@ -4501,7 +4409,12 @@ class ModeSelectOverlay extends StatelessWidget {
                   onTap: () {
                     game.isTwoPlayerMode = true;
                     game.overlays.remove('ModeSelect');
-                    game.overlays.add('Difficulty');
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => const LobbyScreen(),
+                      ),
+                    );
                   },
                 ),
                 const SizedBox(height: 8),
@@ -6390,9 +6303,23 @@ class IntelClubLogoPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
-class WaitingScreen extends StatelessWidget {
+
+/// Shown to the room host (Tom) right after creating a room, while
+/// waiting for the second player (Jerry) to join. Listens to the room
+/// document in real time; the moment its status flips to 'playing'
+/// (set by MultiplayerService.joinRoom when Jerry joins), Tom is taken
+/// straight into a running co-op match via GameApp's multiplayer entry
+/// point — never back through AuthMenu.
+class WaitingScreen extends StatefulWidget {
   final String roomId;
   const WaitingScreen({super.key, required this.roomId});
+
+  @override
+  State<WaitingScreen> createState() => _WaitingScreenState();
+}
+
+class _WaitingScreenState extends State<WaitingScreen> {
+  bool _navigated = false;
 
   @override
   Widget build(BuildContext context) {
@@ -6400,24 +6327,32 @@ class WaitingScreen extends StatelessWidget {
       body: StreamBuilder<DocumentSnapshot>(
         stream: FirebaseFirestore.instance
             .collection('game_rooms')
-            .doc(roomId)
+            .doc(widget.roomId)
             .snapshots(),
         builder: (context, snapshot) {
           if (snapshot.hasData && snapshot.data!.exists) {
             final data = snapshot.data!.data() as Map<String, dynamic>;
 
-            // Kapag naging 'playing' na ang status galing sa Firestore, lilipat si Tom sa Game Screen!
-            if (data['status'] == 'playing') {
+            // Kapag naging 'playing' na ang status galing sa Firestore,
+            // lilipat si Tom papunta sa aktwal na laro (hindi na pabalik
+            // sa AuthMenu) — sa sandaling ito lang tayo mag-navigate,
+            // guarded ng _navigated para hindi paulit-ulit i-push ang
+            // route sa bawat snapshot update.
+            if (data['status'] == 'playing' && !_navigated) {
+              _navigated = true;
               WidgetsBinding.instance.addPostFrameCallback((_) {
-  Navigator.pushReplacement(
-    context,
-    MaterialPageRoute(
-      builder: (context) => GameWidget(
-        game: TomAndJerryGame(),
-      ),
-    ),
-  );
-});
+                if (!mounted) return;
+                Navigator.pushReplacement(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => const GameApp(
+                      startInGame: true,
+                      startTwoPlayer: true,
+                      playerName: 'Tom',
+                    ),
+                  ),
+                );
+              });
             }
           }
 
