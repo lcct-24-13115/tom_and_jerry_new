@@ -15,7 +15,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
-
+import 'package:firebase_core/firebase_core.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 // =====================================================================
 // GLOBAL ANIMATION CLOCK
 // =====================================================================
@@ -350,7 +351,121 @@ class DifficultyScoreStore {
   }
 }
 
+// --- ADMIN-CONFIGURABLE DIFFICULTY SETTINGS ---
+//
+// Per-difficulty game balance (Tom speed, Tom spawn interval, max Toms,
+// target score, points per cheese) editable from the Admin Settings
+// screen. Stored as JSON:
+//   { 'EASY': { 'speed': 50, ... }, 'AVERAGE': {...}, 'HARD': {...} }
+//
+// ENDLESS is not stored: it reuses HARD's values, since it is just HARD
+// continued past its target score.
+class DifficultySettingsStore {
+  static const String _key = 'admin_difficulty_settings';
+
+  static const Map<String, Map<String, num>> _defaults = {
+    'EASY': {
+      'speed': 50,
+      'spawnInterval': 30,
+      'maxToms': 1,
+      'targetScore': 100,
+      'cheesePoints': 10,
+    },
+    'AVERAGE': {
+      'speed': 70,
+      'spawnInterval': 20,
+      'maxToms': 2,
+      'targetScore': 150,
+      'cheesePoints': 10,
+    },
+    'HARD': {
+      'speed': 90,
+      'spawnInterval': 12,
+      'maxToms': 3,
+      'targetScore': 300,
+      'cheesePoints': 10,
+    },
+  };
+
+  /// A fresh, mutable copy of the built-in balance values. A copy is
+  /// handed out every time so callers can never mutate the defaults
+  /// that the fallback logic relies on.
+  static Map<String, Map<String, num>> get defaultSettings => {
+        for (final entry in _defaults.entries)
+          entry.key: Map<String, num>.from(entry.value),
+      };
+
+  /// Stored settings merged over the defaults, so a newly added field
+  /// still resolves for players who saved settings before it existed.
+  static Future<Map<String, Map<String, num>>> loadAll() async {
+    final merged = defaultSettings;
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_key);
+    if (raw == null || raw.isEmpty) return merged;
+    try {
+      final decoded = jsonDecode(raw) as Map<String, dynamic>;
+      decoded.forEach((difficulty, values) {
+        if (values is! Map) return;
+        final target = merged[difficulty] ?? <String, num>{};
+        values.forEach((field, value) {
+          if (value is num) target['$field'] = value;
+        });
+        merged[difficulty] = target;
+      });
+    } catch (_) {
+      return defaultSettings;
+    }
+    return merged;
+  }
+
+  static Future<void> saveAll(Map<String, Map<String, num>> settings) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_key, jsonEncode(settings));
+  }
+
+  static Future<void> resetToDefault() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_key);
+  }
+}
+
 // --- REPORT GENERATION ---
+
+/// Registration window the exported user-log report is limited to.
+enum ReportTimeframe { allTime, daily, weekly, monthly, yearly }
+
+extension ReportTimeframeExtension on ReportTimeframe {
+  /// Oldest registration date still included, or null for [allTime].
+  DateTime? startFrom(DateTime now) {
+    switch (this) {
+      case ReportTimeframe.daily:
+        return now.subtract(const Duration(days: 1));
+      case ReportTimeframe.weekly:
+        return now.subtract(const Duration(days: 7));
+      case ReportTimeframe.monthly:
+        return now.subtract(const Duration(days: 30));
+      case ReportTimeframe.yearly:
+        return now.subtract(const Duration(days: 365));
+      case ReportTimeframe.allTime:
+        return null;
+    }
+  }
+
+  String get label {
+    switch (this) {
+      case ReportTimeframe.daily:
+        return 'Last 24 Hours';
+      case ReportTimeframe.weekly:
+        return 'Last 7 Days';
+      case ReportTimeframe.monthly:
+        return 'Last 30 Days';
+      case ReportTimeframe.yearly:
+        return 'Last 365 Days';
+      case ReportTimeframe.allTime:
+        return 'All Time';
+    }
+  }
+}
 
 /// One line of the exported user-log report. Carries the player's best
 /// score in EVERY category (EASY / AVERAGE / HARD / ENDLESS) so the
@@ -388,12 +503,24 @@ class AccountLogEntry {
 class ReportService {
   static Future<void> downloadUserLogsReport({
     required List<AccountLogEntry> accounts,
+    ReportTimeframe timeframe = ReportTimeframe.allTime,
   }) async {
     final pdf = pw.Document();
 
+    // Only accounts registered inside the selected window. Entries with
+    // an unusable registration date are kept only in the All Time
+    // report, since they cannot be placed in any window.
+    final cutoff = timeframe.startFrom(DateTime.now());
+    final filtered = cutoff == null
+        ? List<AccountLogEntry>.from(accounts)
+        : accounts.where((a) {
+            final created = DateTime.tryParse(a.createdAtIso);
+            return created != null && !created.isBefore(cutoff);
+          }).toList();
+
     // Oldest registration first — this is what makes "the first player
     // who registered" visible at the top of the list.
-    final ordered = List<AccountLogEntry>.from(accounts)
+    final ordered = filtered
       ..sort((a, b) => compareByCreatedAtAsc(a.createdAtIso, b.createdAtIso));
 
     AccountLogEntry? firstPlayer;
@@ -421,7 +548,7 @@ class ReportService {
           pw.SizedBox(height: 4),
           top.isEmpty
               ? pw.Text('No scores recorded yet.', style: const pw.TextStyle(fontSize: 9))
-              : pw.Table.fromTextArray(
+              : pw.TableHelper.fromTextArray(
                   headers: const ['Rank', 'Username', 'Score'],
                   data: List.generate(
                     top.length,
@@ -454,6 +581,7 @@ class ReportService {
             style: pw.TextStyle(fontSize: 13, fontStyle: pw.FontStyle.italic),
           ),
           pw.SizedBox(height: 4),
+          pw.Text('Timeframe: ${timeframe.label}'),
           pw.Text('Generated: ${DateTime.now().toString().split('.').first}'),
           pw.Divider(),
           pw.SizedBox(height: 12),
@@ -505,8 +633,8 @@ class ReportService {
           ),
           pw.SizedBox(height: 8),
           ordered.isEmpty
-              ? pw.Text('No registered accounts.')
-              : pw.Table.fromTextArray(
+              ? pw.Text('No registered accounts in this timeframe.')
+              : pw.TableHelper.fromTextArray(
                   headers: ['#', 'Username', 'Registered At', 'Easy', 'Average', 'Hard', 'Endless'],
                   data: List.generate(
                     ordered.length,
@@ -552,7 +680,7 @@ class ReportService {
 
     await Printing.sharePdf(
       bytes: bytes,
-      filename: 'user_logs_report.pdf',
+      filename: 'user_logs_report_${timeframe.name}.pdf',
     );
   }
 }
@@ -684,6 +812,26 @@ class AppTranslations {
       'endless_badge': 'ENDLESS',
       'endless_unlocked_msg': 'HARD cleared! The chase never ends now — survive as long as you can!',
       'player_out': 'OUT!',
+      'admin_settings': 'GAME SETTINGS',
+      'difficulty_settings_title': 'DIFFICULTY SETTINGS',
+      'speed_label': 'Tom Speed',
+      'spawn_interval_label': 'Tom Spawn Interval (s)',
+      'max_toms_label': 'Max Toms',
+      'target_score_label': 'Target Score',
+      'cheese_points_label': 'Points per Cheese',
+      'save_settings': 'SAVE SETTINGS',
+      'settings_saved': 'Settings saved. They apply on the next run.',
+      'settings_reset': 'Settings restored to defaults.',
+      'invalid_number': 'Please enter a valid non-negative number in every field.',
+      'reset_default': 'Reset to Default',
+      'confirm_reset_title': 'Reset Settings?',
+      'confirm_reset_msg': 'This restores the default balance for every difficulty.',
+      'export_timeframe_label': 'Report Timeframe',
+      'timeframe_all': 'ALL TIME',
+      'timeframe_daily': 'DAILY',
+      'timeframe_weekly': 'WEEKLY',
+      'timeframe_monthly': 'MONTHLY',
+      'timeframe_yearly': 'YEARLY',
     },
     'tl': {
       'login_title': 'PLAYER LOGIN',
@@ -1188,11 +1336,149 @@ Future<void> seedDemoDataIfNeeded() async {
   await prefs.setBool(seededFlagKey, true);
 }
 
-void main() {
+// --- MULTIPLAYER SERVICE & LOBBY ---
+class MultiplayerService {
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+
+  Future<void> createRoom(String roomId, String hostRole) async {
+    await _firestore.collection('game_rooms').doc(roomId).set({
+      'status': 'waiting',
+      'createdHost': hostRole,
+      hostRole: {'x': 100.0, 'y': 100.0},
+    });
+  }
+
+  Future<bool> joinRoom(String roomId, String guestRole) async {
+    DocumentSnapshot doc = await _firestore.collection('game_rooms').doc(roomId).get();
+    if (doc.exists) {
+      await _firestore.collection('game_rooms').doc(roomId).set({
+        'status': 'playing',
+        guestRole: {'x': 200.0, 'y': 200.0},
+      }, SetOptions(merge: true));
+      return true;
+    }
+    return false;
+  }
+}
+
+class LobbyScreen extends StatefulWidget {
+  const LobbyScreen({super.key});
+
+  @override
+  State<LobbyScreen> createState() => _LobbyScreenState();
+}
+
+class _LobbyScreenState extends State<LobbyScreen> {
+  final TextEditingController _roomController = TextEditingController();
+  final MultiplayerService _service = MultiplayerService();
+
+void _handleCreateRoom() async {
+  String roomId = _roomController.text.trim();
+  if (roomId.isNotEmpty) {
+    await _service.createRoom(roomId, 'tom');
+
+    if (!mounted) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => WaitingScreen(roomId: roomId),
+      ),
+    );
+  }
+}
+  }
+
+  void _handleJoinRoom() async {
+    String roomId = _roomController.text.trim();
+    if (roomId.isNotEmpty) {
+      bool joined = await _service.joinRoom(roomId, 'jerry');
+      if (joined) {
+        _navigateToGame();
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Hindi nahanap ang Room Code!')),
+        );
+      }
+    }
+  }
+
+  void _navigateToGame() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => const GameApp()),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: Container(
+          width: 350,
+          padding: const EdgeInsets.all(24),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(16),
+            boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 10)],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Tom & Jerry Multiplayer',
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 20),
+              TextField(
+                controller: _roomController,
+                decoration: const InputDecoration(
+                  labelText: 'I-type ang Room Code (e.g. 1234)',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 20),
+              Row(
+                children: [
+                  Expanded(
+                    child: ElevatedButton(
+                      onPressed: _handleCreateRoom,
+                      child: const Text('Create (Tom)'),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: ElevatedButton(
+                      onPressed: _handleJoinRoom,
+                      child: const Text('Join (Jerry)'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  await Firebase.initializeApp(
+    options: const FirebaseOptions(
+      apiKey: "AIzaSyCjNIArYXYVuJk9JUmhrX38TAFSPiefb18",
+      authDomain: "tom-jerry-multiplayer.firebaseapp.com",
+      projectId: "tom-jerry-multiplayer",
+      storageBucket: "tom-jerry-multiplayer.firebasestorage.app",
+      messagingSenderId: "229198445023",
+      appId: "1:229198445023:web:4c4348f29adf13ffe96c6a",
+    ),
+  );
+
   runApp(const MaterialApp(
     debugShowCheckedModeBanner: false,
-    home: GameApp(),
+    home: const GameApp(),
   ));
 }
 
@@ -1752,6 +2038,7 @@ class TomAndJerryGame extends FlameGame
     world.add(firstTom);
 
     focusNode?.requestFocus();
+    // ignore: invalid_use_of_visible_for_testing_member
     HardwareKeyboard.instance.clearState();
 
     final mazeWidthPx = mazeLayout[0].length * cellSize;
@@ -6102,4 +6389,53 @@ class IntelClubLogoPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+class WaitingScreen extends StatelessWidget {
+  final String roomId;
+  const WaitingScreen({super.key, required this.roomId});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: StreamBuilder<DocumentSnapshot>(
+        stream: FirebaseFirestore.instance
+            .collection('game_rooms')
+            .doc(roomId)
+            .snapshots(),
+        builder: (context, snapshot) {
+          if (snapshot.hasData && snapshot.data!.exists) {
+            final data = snapshot.data!.data() as Map<String, dynamic>;
+
+            // Kapag naging 'playing' na ang status galing sa Firestore, lilipat si Tom sa Game Screen!
+            if (data['status'] == 'playing') {
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+  Navigator.pushReplacement(
+    context,
+    MaterialPageRoute(
+      builder: (context) => GameWidget(
+        game: TomAndJerryGame(),
+      ),
+    ),
+  );
+});
+            }
+          }
+
+          return const Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(height: 20),
+                Text(
+                  'Waiting for Jerry to join...',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
 }
