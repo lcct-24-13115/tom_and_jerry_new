@@ -1348,6 +1348,12 @@ class MultiplayerService {
     });
   }
 
+  /// Returns the room's data, or null if the room doesn't exist yet.
+  Future<Map<String, dynamic>?> getRoom(String roomId) async {
+    final doc = await _firestore.collection('game_rooms').doc(roomId).get();
+    return doc.exists ? doc.data() : null;
+  }
+
   Future<bool> joinRoom(String roomId, String guestRole) async {
     DocumentSnapshot doc = await _firestore.collection('game_rooms').doc(roomId).get();
     if (doc.exists) {
@@ -1372,44 +1378,147 @@ class _LobbyScreenState extends State<LobbyScreen> {
   final TextEditingController _roomController = TextEditingController();
   final MultiplayerService _service = MultiplayerService();
 
-void _handleCreateRoom() async {
-  String roomId = _roomController.text.trim();
-  if (roomId.isNotEmpty) {
-    await _service.createRoom(roomId, 'tom');
+  String? _selectedRole; // 'tom' | 'jerry'
+  bool _isBusy = false;
 
-    if (!mounted) return;
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (context) => WaitingScreen(roomId: roomId),
-      ),
-    );
+  @override
+  void dispose() {
+    _roomController.dispose();
+    super.dispose();
   }
-}
 
-  void _handleJoinRoom() async {
-    String roomId = _roomController.text.trim();
-    if (roomId.isNotEmpty) {
-      bool joined = await _service.joinRoom(roomId, 'jerry');
+  String _nameForRole(String role) => role == 'tom' ? 'Tom' : 'Jerry';
+
+  void _showMessage(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  /// Entry point ng dalawang Character buttons.
+  /// - Walang existing room -> gagawa ng bago (Create) gamit ang napiling role.
+  /// - May existing room -> sasali (Join) gamit ang napiling role.
+  Future<void> _handleRoleSelected(String role) async {
+    if (_isBusy) return;
+
+    final roomId = _roomController.text.trim();
+    if (roomId.isEmpty) {
+      _showMessage('I-type muna ang Room Code!');
+      return;
+    }
+
+    setState(() {
+      _selectedRole = role;
+      _isBusy = true;
+    });
+
+    try {
+      final room = await _service.getRoom(roomId);
       if (!mounted) return;
-      if (joined) {
-        _navigateToGame();
+
+      if (room == null) {
+        await _handleCreateRoom(roomId, role);
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Hindi nahanap ang Room Code!')),
-        );
+        await _handleJoinRoom(roomId, role, room);
       }
+    } catch (e) {
+      if (mounted) _showMessage('May error: $e');
+    } finally {
+      if (mounted) setState(() => _isBusy = false);
     }
   }
 
-  void _navigateToGame() {
+  Future<void> _handleCreateRoom(String roomId, String role) async {
+    await _service.createRoom(roomId, role);
+    if (!mounted) return;
+
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (context) => const GameApp(
+        builder: (context) => WaitingScreen(roomId: roomId, role: role),
+      ),
+    );
+  }
+
+  Future<void> _handleJoinRoom(
+    String roomId,
+    String role,
+    Map<String, dynamic> room,
+  ) async {
+    if (room['status'] != 'waiting') {
+      _showMessage('Nagsimula na ang laro sa room na ito. Gumamit ng ibang Room Code.');
+      return;
+    }
+
+    final hostRole = (room['createdHost'] as String?) ?? 'tom';
+    if (hostRole == role) {
+      _showMessage(
+        'Kinuha na ni ${_nameForRole(hostRole)} ang role na iyan. '
+        'Piliin ang ${_nameForRole(hostRole == 'tom' ? 'jerry' : 'tom')}.',
+      );
+      return;
+    }
+
+    final joined = await _service.joinRoom(roomId, role);
+    if (!mounted) return;
+
+    if (joined) {
+      _navigateToGame(roomId, role);
+    } else {
+      _showMessage('Hindi nahanap ang Room Code!');
+    }
+  }
+
+  void _navigateToGame(String roomId, String role) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => GameApp(
           startInGame: true,
           startTwoPlayer: true,
-          playerName: 'Jerry',
+          playerName: _nameForRole(role),
+          roomId: roomId,
+          role: role,
+        ),
+      ),
+    );
+  }
+
+  Widget _roleButton({
+    required String role,
+    required String emoji,
+    required String label,
+    required String sublabel,
+    required Color color,
+  }) {
+    final selected = _selectedRole == role;
+    return Expanded(
+      child: ElevatedButton(
+        onPressed: _isBusy ? null : () => _handleRoleSelected(role),
+        style: ElevatedButton.styleFrom(
+          backgroundColor: color,
+          foregroundColor: Colors.white,
+          disabledBackgroundColor: color.withValues(alpha: 0.5),
+          disabledForegroundColor: Colors.white70,
+          padding: const EdgeInsets.symmetric(vertical: 16),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: BorderSide(
+              color: selected ? AppColors.cheeseYellow : Colors.transparent,
+              width: 3,
+            ),
+          ),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(emoji, style: const TextStyle(fontSize: 34)),
+            const SizedBox(height: 6),
+            Text(
+              label,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+            ),
+            Text(sublabel, style: const TextStyle(fontSize: 11)),
+          ],
         ),
       ),
     );
@@ -1437,29 +1546,47 @@ void _handleCreateRoom() async {
               const SizedBox(height: 20),
               TextField(
                 controller: _roomController,
+                enabled: !_isBusy,
                 decoration: const InputDecoration(
                   labelText: 'I-type ang Room Code (e.g. 1234)',
                   border: OutlineInputBorder(),
                 ),
               ),
+              const SizedBox(height: 8),
+              const Text(
+                'Bagong code = gagawa ng room. Existing code = sasali sa room.',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 12, color: Colors.black54),
+              ),
               const SizedBox(height: 20),
+              const Text(
+                'Pumili ng karakter',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 10),
               Row(
                 children: [
-                  Expanded(
-                    child: ElevatedButton(
-                      onPressed: _handleCreateRoom,
-                      child: const Text('Create (Tom)'),
-                    ),
+                  _roleButton(
+                    role: 'tom',
+                    emoji: '🐱',
+                    label: 'Play as Tom',
+                    sublabel: 'Player 1',
+                    color: Colors.blueGrey.shade600,
                   ),
                   const SizedBox(width: 10),
-                  Expanded(
-                    child: ElevatedButton(
-                      onPressed: _handleJoinRoom,
-                      child: const Text('Join (Jerry)'),
-                    ),
+                  _roleButton(
+                    role: 'jerry',
+                    emoji: '🐭',
+                    label: 'Play as Jerry',
+                    sublabel: 'Player 2',
+                    color: Colors.brown.shade400,
                   ),
                 ],
               ),
+              if (_isBusy) ...[
+                const SizedBox(height: 16),
+                const CircularProgressIndicator(),
+              ],
             ],
           ),
         ),
@@ -1492,12 +1619,16 @@ class GameApp extends StatefulWidget {
   final bool startInGame;
   final bool startTwoPlayer;
   final String? playerName;
+  final String? roomId;
+  final String? role; // 'tom' | 'jerry'
 
   const GameApp({
     super.key,
     this.startInGame = false,
     this.startTwoPlayer = false,
     this.playerName,
+    this.roomId,
+    this.role,
   });
 
   @override
@@ -1514,6 +1645,8 @@ class _GameAppState extends State<GameApp> {
     super.initState();
     game = TomAndJerryGame();
     game.focusNode = _gameFocusNode;
+    game.roomId = widget.roomId;
+    game.playerRole = widget.role;
 
     if (widget.startInGame) {
       // Multiplayer entry point: bypass AuthMenu/MainMenu/ModeSelect/
@@ -1685,6 +1818,10 @@ class TomAndJerryGame extends FlameGame
   // on EASY instead of waiting for the player to click through
   // MainMenu -> ModeSelect -> Difficulty.
   bool pendingAutoStart = false;
+
+  // Galing sa Lobby/Waiting flow. Null kapag 1-player o hindi galing sa multiplayer.
+  String? roomId;
+  String? playerRole; // 'tom' | 'jerry'
   final ValueNotifier<bool> isDarkModeNotifier = ValueNotifier<bool>(true);
   final ValueNotifier<AppLanguage> languageNotifier = ValueNotifier<AppLanguage>(AppLanguage.english);
 
@@ -6445,7 +6582,8 @@ class IntelClubLogoPainter extends CustomPainter {
 /// point — never back through AuthMenu.
 class WaitingScreen extends StatefulWidget {
   final String roomId;
-  const WaitingScreen({super.key, required this.roomId});
+  final String role; // 'tom' | 'jerry' (role ng host)
+  const WaitingScreen({super.key, required this.roomId, this.role = 'tom'});
 
   @override
   State<WaitingScreen> createState() => _WaitingScreenState();
@@ -6453,6 +6591,9 @@ class WaitingScreen extends StatefulWidget {
 
 class _WaitingScreenState extends State<WaitingScreen> {
   bool _navigated = false;
+
+  String get _myName => widget.role == 'tom' ? 'Tom' : 'Jerry';
+  String get _opponentName => widget.role == 'tom' ? 'Jerry' : 'Tom';
 
   @override
   Widget build(BuildContext context) {
@@ -6466,11 +6607,8 @@ class _WaitingScreenState extends State<WaitingScreen> {
           if (snapshot.hasData && snapshot.data!.exists) {
             final data = snapshot.data!.data() as Map<String, dynamic>;
 
-            // Kapag naging 'playing' na ang status galing sa Firestore,
-            // lilipat si Tom papunta sa aktwal na laro (hindi na pabalik
-            // sa AuthMenu) — sa sandaling ito lang tayo mag-navigate,
-            // guarded ng _navigated para hindi paulit-ulit i-push ang
-            // route sa bawat snapshot update.
+            // Kapag naging 'playing' na ang status, lilipat sa laro.
+            // Guarded ng _navigated para hindi paulit-ulit ang push.
             if (data['status'] == 'playing' && !_navigated) {
               _navigated = true;
               WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -6478,10 +6616,12 @@ class _WaitingScreenState extends State<WaitingScreen> {
                 Navigator.pushReplacement(
                   context,
                   MaterialPageRoute(
-                    builder: (context) => const GameApp(
+                    builder: (context) => GameApp(
                       startInGame: true,
                       startTwoPlayer: true,
-                      playerName: 'Tom',
+                      playerName: _myName,
+                      roomId: widget.roomId,
+                      role: widget.role,
                     ),
                   ),
                 );
@@ -6489,15 +6629,20 @@ class _WaitingScreenState extends State<WaitingScreen> {
             }
           }
 
-          return const Center(
+          return Center(
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                CircularProgressIndicator(),
-                SizedBox(height: 20),
+                const CircularProgressIndicator(),
+                const SizedBox(height: 20),
                 Text(
-                  'Waiting for Jerry to join...',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  'Room ${widget.roomId} \u2022 Ikaw si $_myName',
+                  style: const TextStyle(fontSize: 16),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Waiting for $_opponentName to join...',
+                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                 ),
               ],
             ),
