@@ -1348,12 +1348,6 @@ class MultiplayerService {
     });
   }
 
-  /// Returns the room's data, or null if the room doesn't exist yet.
-  Future<Map<String, dynamic>?> getRoom(String roomId) async {
-    final doc = await _firestore.collection('game_rooms').doc(roomId).get();
-    return doc.exists ? doc.data() : null;
-  }
-
   Future<bool> joinRoom(String roomId, String guestRole) async {
     DocumentSnapshot doc = await _firestore.collection('game_rooms').doc(roomId).get();
     if (doc.exists) {
@@ -1378,147 +1372,44 @@ class _LobbyScreenState extends State<LobbyScreen> {
   final TextEditingController _roomController = TextEditingController();
   final MultiplayerService _service = MultiplayerService();
 
-  String? _selectedRole; // 'tom' | 'jerry'
-  bool _isBusy = false;
+void _handleCreateRoom() async {
+  String roomId = _roomController.text.trim();
+  if (roomId.isNotEmpty) {
+    await _service.createRoom(roomId, 'tom');
 
-  @override
-  void dispose() {
-    _roomController.dispose();
-    super.dispose();
-  }
-
-  String _nameForRole(String role) => role == 'tom' ? 'Tom' : 'Jerry';
-
-  void _showMessage(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
-  }
-
-  /// Entry point ng dalawang Character buttons.
-  /// - Walang existing room -> gagawa ng bago (Create) gamit ang napiling role.
-  /// - May existing room -> sasali (Join) gamit ang napiling role.
-  Future<void> _handleRoleSelected(String role) async {
-    if (_isBusy) return;
-
-    final roomId = _roomController.text.trim();
-    if (roomId.isEmpty) {
-      _showMessage('I-type muna ang Room Code!');
-      return;
-    }
-
-    setState(() {
-      _selectedRole = role;
-      _isBusy = true;
-    });
-
-    try {
-      final room = await _service.getRoom(roomId);
-      if (!mounted) return;
-
-      if (room == null) {
-        await _handleCreateRoom(roomId, role);
-      } else {
-        await _handleJoinRoom(roomId, role, room);
-      }
-    } catch (e) {
-      if (mounted) _showMessage('May error: $e');
-    } finally {
-      if (mounted) setState(() => _isBusy = false);
-    }
-  }
-
-  Future<void> _handleCreateRoom(String roomId, String role) async {
-    await _service.createRoom(roomId, role);
     if (!mounted) return;
-
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (context) => WaitingScreen(roomId: roomId, role: role),
+        builder: (context) => WaitingScreen(roomId: roomId),
       ),
     );
   }
+}
 
-  Future<void> _handleJoinRoom(
-    String roomId,
-    String role,
-    Map<String, dynamic> room,
-  ) async {
-    if (room['status'] != 'waiting') {
-      _showMessage('Nagsimula na ang laro sa room na ito. Gumamit ng ibang Room Code.');
-      return;
-    }
-
-    final hostRole = (room['createdHost'] as String?) ?? 'tom';
-    if (hostRole == role) {
-      _showMessage(
-        'Kinuha na ni ${_nameForRole(hostRole)} ang role na iyan. '
-        'Piliin ang ${_nameForRole(hostRole == 'tom' ? 'jerry' : 'tom')}.',
-      );
-      return;
-    }
-
-    final joined = await _service.joinRoom(roomId, role);
-    if (!mounted) return;
-
-    if (joined) {
-      _navigateToGame(roomId, role);
-    } else {
-      _showMessage('Hindi nahanap ang Room Code!');
+  void _handleJoinRoom() async {
+    String roomId = _roomController.text.trim();
+    if (roomId.isNotEmpty) {
+      bool joined = await _service.joinRoom(roomId, 'jerry');
+      if (!mounted) return;
+      if (joined) {
+        _navigateToGame();
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Hindi nahanap ang Room Code!')),
+        );
+      }
     }
   }
 
-  void _navigateToGame(String roomId, String role) {
+  void _navigateToGame() {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (context) => GameApp(
+        builder: (context) => const GameApp(
           startInGame: true,
           startTwoPlayer: true,
-          playerName: _nameForRole(role),
-          roomId: roomId,
-          role: role,
-        ),
-      ),
-    );
-  }
-
-  Widget _roleButton({
-    required String role,
-    required String emoji,
-    required String label,
-    required String sublabel,
-    required Color color,
-  }) {
-    final selected = _selectedRole == role;
-    return Expanded(
-      child: ElevatedButton(
-        onPressed: _isBusy ? null : () => _handleRoleSelected(role),
-        style: ElevatedButton.styleFrom(
-          backgroundColor: color,
-          foregroundColor: Colors.white,
-          disabledBackgroundColor: color.withValues(alpha: 0.5),
-          disabledForegroundColor: Colors.white70,
-          padding: const EdgeInsets.symmetric(vertical: 16),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
-            side: BorderSide(
-              color: selected ? AppColors.cheeseYellow : Colors.transparent,
-              width: 3,
-            ),
-          ),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(emoji, style: const TextStyle(fontSize: 34)),
-            const SizedBox(height: 6),
-            Text(
-              label,
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
-            ),
-            Text(sublabel, style: const TextStyle(fontSize: 11)),
-          ],
+          playerName: 'Jerry',
         ),
       ),
     );
@@ -1546,47 +1437,29 @@ class _LobbyScreenState extends State<LobbyScreen> {
               const SizedBox(height: 20),
               TextField(
                 controller: _roomController,
-                enabled: !_isBusy,
                 decoration: const InputDecoration(
                   labelText: 'I-type ang Room Code (e.g. 1234)',
                   border: OutlineInputBorder(),
                 ),
               ),
-              const SizedBox(height: 8),
-              const Text(
-                'Bagong code = gagawa ng room. Existing code = sasali sa room.',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 12, color: Colors.black54),
-              ),
               const SizedBox(height: 20),
-              const Text(
-                'Pumili ng karakter',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 10),
               Row(
                 children: [
-                  _roleButton(
-                    role: 'tom',
-                    emoji: '🐱',
-                    label: 'Play as Tom',
-                    sublabel: 'Player 1',
-                    color: Colors.blueGrey.shade600,
+                  Expanded(
+                    child: ElevatedButton(
+                      onPressed: _handleCreateRoom,
+                      child: const Text('Create (Tom)'),
+                    ),
                   ),
                   const SizedBox(width: 10),
-                  _roleButton(
-                    role: 'jerry',
-                    emoji: '🐭',
-                    label: 'Play as Jerry',
-                    sublabel: 'Player 2',
-                    color: Colors.brown.shade400,
+                  Expanded(
+                    child: ElevatedButton(
+                      onPressed: _handleJoinRoom,
+                      child: const Text('Join (Jerry)'),
+                    ),
                   ),
                 ],
               ),
-              if (_isBusy) ...[
-                const SizedBox(height: 16),
-                const CircularProgressIndicator(),
-              ],
             ],
           ),
         ),
@@ -1619,16 +1492,12 @@ class GameApp extends StatefulWidget {
   final bool startInGame;
   final bool startTwoPlayer;
   final String? playerName;
-  final String? roomId;
-  final String? role; // 'tom' | 'jerry'
 
   const GameApp({
     super.key,
     this.startInGame = false,
     this.startTwoPlayer = false,
     this.playerName,
-    this.roomId,
-    this.role,
   });
 
   @override
@@ -1645,8 +1514,6 @@ class _GameAppState extends State<GameApp> {
     super.initState();
     game = TomAndJerryGame();
     game.focusNode = _gameFocusNode;
-    game.roomId = widget.roomId;
-    game.playerRole = widget.role;
 
     if (widget.startInGame) {
       // Multiplayer entry point: bypass AuthMenu/MainMenu/ModeSelect/
@@ -1678,13 +1545,11 @@ class _GameAppState extends State<GameApp> {
       'GameOver': (context, game) => GameOverOverlay(game: game),
       'Pause': (context, game) => PauseMenuOverlay(game: game),
       'LevelComplete': (context, game) => LevelCompleteOverlay(game: game),
-      'VersusResult': (context, game) => VersusResultOverlay(game: game),
     };
   }
 
   @override
   void dispose() {
-    game.stopVersusSync();
     _gameFocusNode.dispose();
     super.dispose();
   }
@@ -1820,28 +1685,6 @@ class TomAndJerryGame extends FlameGame
   // on EASY instead of waiting for the player to click through
   // MainMenu -> ModeSelect -> Difficulty.
   bool pendingAutoStart = false;
-
-  // Galing sa Lobby/Waiting flow. Null kapag 1-player o hindi galing sa multiplayer.
-  String? roomId;
-  String? playerRole; // 'tom' | 'jerry'
-
-  // ---- Versus (realtime Tom vs Jerry) settings ----
-  static const int versusTargetScore = 100; // Jerry wins at this many points
-  static const int versusCheesePoints = 10;
-  static const int versusCheeseCount = 16;
-  static const double versusTomSpeed = 130.0; // Jerry runs at 140
-
-  bool get isVersusMode => roomId != null && playerRole != null;
-
-  DocumentReference<Map<String, dynamic>>? _roomRef;
-  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _roomSub;
-  double _syncTimer = 0;
-  Vector2? _lastSent;
-  int _matchId = 0;
-  bool _versusOver = false;
-  bool _rematchSent = false;
-  String versusWinner = ''; // 'tom' | 'jerry' | 'left'
-  final ValueNotifier<bool> rematchWaitingNotifier = ValueNotifier<bool>(false);
   final ValueNotifier<bool> isDarkModeNotifier = ValueNotifier<bool>(true);
   final ValueNotifier<AppLanguage> languageNotifier = ValueNotifier<AppLanguage>(AppLanguage.english);
 
@@ -1968,13 +1811,7 @@ class TomAndJerryGame extends FlameGame
     // needs the world/camera to already be ready.
     if (pendingAutoStart) {
       pendingAutoStart = false;
-      if (isVersusMode) {
-        isTwoPlayerMode = false; // versus = 1 Tom + 1 Jerry, hindi co-op
-        startGame(playerName, 'EASY');
-        _startVersusSync();
-      } else {
-        startGame(playerName, 'EASY');
-      }
+      startGame(playerName, 'EASY');
     }
   }
 
@@ -1992,11 +1829,6 @@ class TomAndJerryGame extends FlameGame
     // still awards the cheese/power-up every frame.
     _checkPickupProximity();
 
-    if (isVersusMode) {
-      _versusTick(dt);
-      return;
-    }
-
     _tomSpawnTimer += dt;
     final interval = _tomSpawnIntervalForDifficulty(difficulty);
     final maxToms = _maxTomsForDifficulty(difficulty);
@@ -2013,7 +1845,7 @@ class TomAndJerryGame extends FlameGame
   /// an overlap event that frame.
   void _checkPickupProximity() {
     final players = <JerryPlayer>[
-      if (jerry1 != null && !jerry1!.isRemote) jerry1!,
+      if (jerry1 != null) jerry1!,
       if (jerry2 != null) jerry2!,
     ];
     if (players.isEmpty) return;
@@ -2111,7 +1943,6 @@ class TomAndJerryGame extends FlameGame
   }
 
   void pauseGame() {
-    if (isVersusMode) return;
     pauseEngine();
     FlameAudio.bgm.pause();
     overlays.add('Pause');
@@ -2220,17 +2051,12 @@ class TomAndJerryGame extends FlameGame
       }
     }
 
-    if (isVersusMode) {
-      _spawnVersusCheeses();
-    } else {
-      _spawnCheeses(12);
-      _spawnPowerUp();
-    }
+    _spawnCheeses(12);
+    _spawnPowerUp();
 
     jerry1 = JerryPlayer(
       gridPosition: Vector2(1, 1),
       isPlayerTwo: false,
-      isRemote: isVersusMode && playerRole == 'tom',
     );
     world.add(jerry1!);
 
@@ -2244,13 +2070,11 @@ class TomAndJerryGame extends FlameGame
       jerry2 = null;
     }
 
-    final tomSpeed = isVersusMode ? versusTomSpeed : _speedForDifficulty(difficulty);
+    final tomSpeed = _speedForDifficulty(difficulty);
     final firstTom = TomChaser(
       gridPosition: Vector2(13, 13),
       speed: tomSpeed,
       game: this,
-      isHuman: isVersusMode,
-      isRemote: isVersusMode && playerRole == 'jerry',
     );
     toms.add(firstTom);
     world.add(firstTom);
@@ -2312,9 +2136,8 @@ class TomAndJerryGame extends FlameGame
   /// Points a single cheese is worth in the run currently in progress —
   /// used by CheeseComponent so its floating "+N" popup always matches
   /// the score actually awarded.
-  int get currentCheesePoints => isVersusMode
-      ? versusCheesePoints
-      : _cheesePointsForDifficulty(isEndlessNotifier.value ? 'ENDLESS' : difficulty);
+  int get currentCheesePoints =>
+      _cheesePointsForDifficulty(isEndlessNotifier.value ? 'ENDLESS' : difficulty);
 
   String? nextDifficulty() {
     switch (difficulty) {
@@ -2386,10 +2209,6 @@ class TomAndJerryGame extends FlameGame
   }
 
   void _checkLevelComplete() {
-    if (isVersusMode) {
-      _checkVersusWin();
-      return;
-    }
     if (_levelCompleteTriggered) return;
     final total = p1ScoreNotifier.value + (isTwoPlayerMode ? p2ScoreNotifier.value : 0);
     if (total >= _targetScoreForDifficulty(difficulty)) {
@@ -2478,11 +2297,6 @@ class TomAndJerryGame extends FlameGame
   /// partner — the maze only truly ends once BOTH players have been
   /// caught.
   void onPlayerCaught(JerryPlayer player) async {
-    if (isVersusMode) {
-      // Si Jerry (local) ang nagde-decide kung nahuli siya.
-      if (!player.isRemote && !_versusOver) _endVersusAsAuthority('tom');
-      return;
-    }
     if (player.isCaught) return;
     player.isCaught = true;
 
@@ -2527,248 +2341,6 @@ class TomAndJerryGame extends FlameGame
       // Both players have now been caught — the run is truly over.
       onCaughtByTom();
     }
-  }
-
-  // =====================================================================
-  // VERSUS: REALTIME TOM vs JERRY (Firestore sync)
-  // =====================================================================
-
-  /// Pare-parehong seed sa dalawang device, galing sa Room Code.
-  /// (Sariling PRNG para pareho ang cheese sa web/phone/desktop.)
-  int _versusSeed() {
-    int seed = 7;
-    for (final c in (roomId ?? '').codeUnits) {
-      seed = (seed * 31 + c) % 2147483647;
-    }
-    return seed == 0 ? 1 : seed;
-  }
-
-  void _spawnVersusCheeses() {
-    final cells = _getEmptyCells();
-    int s = _versusSeed();
-    for (int i = cells.length - 1; i > 0; i--) {
-      s = (s * 48271) % 2147483647;
-      final j = s % (i + 1);
-      final tmp = cells[i];
-      cells[i] = cells[j];
-      cells[j] = tmp;
-    }
-    int count = versusCheeseCount;
-    if (count > cells.length) count = cells.length;
-    for (final cell in cells.take(count)) {
-      world.add(CheeseComponent(gridPosition: cell, game: this));
-      _cheeseCount++;
-    }
-  }
-
-  void _startVersusSync() {
-    final id = roomId;
-    if (id == null || playerRole == null) return;
-    _roomRef = FirebaseFirestore.instance.collection('game_rooms').doc(id);
-    _versusOver = false;
-    _rematchSent = false;
-    _matchId = 0;
-    _syncTimer = 0;
-    _lastSent = null;
-    _roomSub?.cancel();
-    _roomSub = _roomRef!.snapshots().listen(_onRoomSnapshot, onError: (_) {});
-  }
-
-  void stopVersusSync() {
-    _roomSub?.cancel();
-    _roomSub = null;
-  }
-
-  /// Tinatawag every frame habang tumatakbo ang laban.
-  /// Nagpapadala ng sariling posisyon ~8x/segundo, pero kapag gumalaw lang.
-  void _versusTick(double dt) {
-    if (_versusOver) return;
-    _syncTimer += dt;
-    if (_syncTimer < 0.12) return;
-    _syncTimer = 0;
-
-    final role = playerRole;
-    if (role == null) return;
-    Vector2? mine;
-    if (role == 'tom') {
-      if (toms.isNotEmpty) mine = toms.first.position;
-    } else {
-      mine = jerry1?.position;
-    }
-    if (mine == null) return;
-    final last = _lastSent;
-    if (last != null && (mine - last).length2 < 0.25) return;
-    _lastSent = mine.clone();
-
-    _roomRef?.update({
-      role: {'x': mine.x, 'y': mine.y, 'live': true},
-    }).catchError((_) {});
-  }
-
-  void _onRoomSnapshot(DocumentSnapshot<Map<String, dynamic>> snap) {
-    final data = snap.data();
-    final me = playerRole;
-    if (data == null || me == null) return;
-    final other = me == 'tom' ? 'jerry' : 'tom';
-
-    // Rematch: bagong matchId -> i-restart ang laban sa dalawang device.
-    final matchId = (data['matchId'] as num?)?.toInt() ?? 0;
-    if (matchId > _matchId) {
-      _matchId = matchId;
-      _restartVersusMatch();
-      return;
-    }
-
-    // Posisyon ng kalaban
-    final op = data[other];
-    if (op is Map && op['live'] == true) {
-      final x = (op['x'] as num?)?.toDouble();
-      final y = (op['y'] as num?)?.toDouble();
-      if (x != null && y != null) {
-        final target = Vector2(x, y);
-        if (other == 'jerry') {
-          jerry1?.remoteTarget = target;
-        } else if (toms.isNotEmpty) {
-          toms.first.remoteTarget = target;
-        }
-      }
-    }
-
-    // Sa screen ni Tom: sundan ang score at cheese ni Jerry.
-    if (me == 'tom') {
-      final score = (data['score'] as num?)?.toInt();
-      if (score != null && score != p1ScoreNotifier.value) {
-        p1ScoreNotifier.value = score;
-      }
-      final collected = data['collected'];
-      if (collected is List && collected.isNotEmpty) {
-        _applyCollected(collected.map((e) => e.toString()).toSet());
-      }
-    }
-
-    // Tapos na ang laban / umalis ang kalaban
-    if (!_versusOver) {
-      final left = data['left'];
-      if (left is String && left.isNotEmpty && left != me) {
-        _showVersusResult('left');
-      } else if (data['status'] == 'over') {
-        _showVersusResult((data['winner'] as String?) ?? '');
-      }
-    }
-
-    // Si Jerry ang nag-a-approve ng rematch kapag pareho nang pumindot.
-    if (_versusOver && me == 'jerry' && !_rematchSent) {
-      final rem = data['rematch'];
-      if (rem is Map && rem['tom'] == true && rem['jerry'] == true) {
-        _resetRoomForRematch();
-      }
-    }
-  }
-
-  void _applyCollected(Set<String> keys) {
-    for (final cheese in world.children.query<CheeseComponent>().toList()) {
-      final key = '${cheese.gridPosition.x.toInt()},${cheese.gridPosition.y.toInt()}';
-      if (keys.contains(key)) {
-        world.add(SparkleBurstComponent(
-          position: cheese.position + cheese.size / 2,
-          color: const Color(0xFFFFC107),
-        ));
-        _playSfx('cheese.wav');
-        cheese.removeFromParent();
-      }
-    }
-  }
-
-  /// Tinatawag ng CheeseComponent (sa screen ni Jerry lang, dahil hindi
-  /// nakaka-collect ang remote Jerry) para ipaalam kay Tom.
-  void onVersusCheeseCollected(Vector2 grid) {
-    if (!isVersusMode) return;
-    final key = '${grid.x.toInt()},${grid.y.toInt()}';
-    _roomRef?.update({
-      'collected': FieldValue.arrayUnion([key]),
-      'score': p1ScoreNotifier.value,
-    }).catchError((_) {});
-  }
-
-  void _checkVersusWin() {
-    if (_versusOver || playerRole != 'jerry') return;
-    if (p1ScoreNotifier.value >= versusTargetScore) {
-      _endVersusAsAuthority('jerry');
-    }
-  }
-
-  void _endVersusAsAuthority(String winner) {
-    if (_versusOver) return;
-    _showVersusResult(winner);
-    _roomRef?.update({
-      'status': 'over',
-      'winner': winner,
-      'score': p1ScoreNotifier.value,
-    }).catchError((_) {});
-  }
-
-  void _showVersusResult(String winner) {
-    if (_versusOver) return;
-    _versusOver = true;
-    versusWinner = winner;
-    rematchWaitingNotifier.value = false;
-    p1TouchDirection.value = Vector2.zero();
-    _playSfx(winner == playerRole ? 'powerup.wav' : 'caught.wav');
-    FlameAudio.bgm.stop();
-    pauseEngine();
-    overlays.remove('HUD');
-    overlays.remove('TouchControls');
-    overlays.add('VersusResult');
-  }
-
-  void requestRematch() {
-    final role = playerRole;
-    if (role == null || _rematchSent || versusWinner == 'left') return;
-    rematchWaitingNotifier.value = true;
-    _roomRef?.update({'rematch.$role': true}).catchError((_) {});
-  }
-
-  void _resetRoomForRematch() {
-    _rematchSent = true;
-    _roomRef?.update({
-      'status': 'playing',
-      'winner': '',
-      'left': '',
-      'score': 0,
-      'collected': <String>[],
-      'matchId': _matchId + 1,
-      'rematch': {'tom': false, 'jerry': false},
-      'tom': {'live': false},
-      'jerry': {'live': false},
-    }).catchError((_) {});
-  }
-
-  void _restartVersusMatch() {
-    _versusOver = false;
-    _rematchSent = false;
-    versusWinner = '';
-    rematchWaitingNotifier.value = false;
-    _lastSent = null;
-    _syncTimer = 0;
-    overlays.remove('VersusResult');
-    overlays.add('HUD');
-    overlays.add('TouchControls');
-    p1ScoreNotifier.value = 0;
-    p2ScoreNotifier.value = 0;
-    _buildMaze();
-    resumeEngine();
-    if (!isMutedNotifier.value) {
-      FlameAudio.bgm.play('bg_music.mp3', volume: 0.4);
-    }
-  }
-
-  void leaveVersus() {
-    final role = playerRole;
-    if (role != null) {
-      _roomRef?.update({'left': role}).catchError((_) {});
-    }
-    stopVersusSync();
-    FlameAudio.bgm.stop();
   }
 
   void onCaughtByTom() async {
@@ -3201,7 +2773,6 @@ class CheeseComponent extends PositionComponent with CollisionCallbacks, HasGame
     _collected = true;
 
     game.collectCheese(other.isPlayerTwo);
-    game.onVersusCheeseCollected(gridPosition);
     game.world.add(SparkleBurstComponent(
       position: position + size / 2,
       color: const Color(0xFFFFC107),
@@ -3216,7 +2787,7 @@ class CheeseComponent extends PositionComponent with CollisionCallbacks, HasGame
   @override
   void onCollisionStart(Set<Vector2> intersectionPoints, PositionComponent other) {
     super.onCollisionStart(intersectionPoints, other);
-    if (other is JerryPlayer && !other.isRemote) collectBy(other);
+    if (other is JerryPlayer) collectBy(other);
   }
 }
 
@@ -3309,7 +2880,7 @@ class ScatterPowerUpComponent extends PositionComponent with CollisionCallbacks 
   @override
   void onCollisionStart(Set<Vector2> intersectionPoints, PositionComponent other) {
     super.onCollisionStart(intersectionPoints, other);
-    if (other is JerryPlayer && !other.isRemote) collectBy(other);
+    if (other is JerryPlayer) collectBy(other);
   }
 }
 
@@ -3335,14 +2906,9 @@ class JerryPlayer extends PositionComponent
   double _facingLerp = 1; // smoothly interpolated flip
   double _trailTimer = 0;
 
-  // Versus mode: kapag true, ang posisyon ay galing sa network (hindi sa keyboard).
-  final bool isRemote;
-  Vector2? remoteTarget;
-
   JerryPlayer({
     required this.gridPosition,
     required this.isPlayerTwo,
-    this.isRemote = false,
   }) : super(
           position: gridPosition * cellSize + Vector2.all(cellSize * 0.05),
           size: Vector2.all(cellSize * 0.9),
@@ -3507,7 +3073,7 @@ class JerryPlayer extends PositionComponent
     final labelFloat = sin(_idleTime * 2.6 + (isPlayerTwo ? 1.4 : 0)) * h * 0.03;
     final labelPainter = TextPainter(
       text: TextSpan(
-        text: game.isVersusMode ? 'JERRY' : (isPlayerTwo ? 'P2' : 'P1'),
+        text: isPlayerTwo ? 'P2' : 'P1',
         style: TextStyle(
           fontSize: h * 0.22,
           fontWeight: FontWeight.w900,
@@ -3527,11 +3093,6 @@ class JerryPlayer extends PositionComponent
 
     _idleTime += dt;
 
-    if (isRemote) {
-      _updateRemote(dt);
-      return;
-    }
-
     _velocity.setZero();
     final keys = HardwareKeyboard.instance;
 
@@ -3540,13 +3101,6 @@ class JerryPlayer extends PositionComponent
       if (keys.isLogicalKeyPressed(LogicalKeyboardKey.arrowDown)) _velocity.y += 1;
       if (keys.isLogicalKeyPressed(LogicalKeyboardKey.arrowLeft)) _velocity.x -= 1;
       if (keys.isLogicalKeyPressed(LogicalKeyboardKey.arrowRight)) _velocity.x += 1;
-      if (game.isVersusMode) {
-        // Sa versus, arrows O WASD ang pwede.
-        if (keys.isLogicalKeyPressed(LogicalKeyboardKey.keyW)) _velocity.y -= 1;
-        if (keys.isLogicalKeyPressed(LogicalKeyboardKey.keyS)) _velocity.y += 1;
-        if (keys.isLogicalKeyPressed(LogicalKeyboardKey.keyA)) _velocity.x -= 1;
-        if (keys.isLogicalKeyPressed(LogicalKeyboardKey.keyD)) _velocity.x += 1;
-      }
       _velocity.add(game.p1TouchDirection.value);
     } else {
       if (keys.isLogicalKeyPressed(LogicalKeyboardKey.keyW)) _velocity.y -= 1;
@@ -3588,41 +3142,6 @@ class JerryPlayer extends PositionComponent
     if (!rectHitsWall(tryY)) position.y += delta.y;
 
     // Dust trail while running.
-    _trailTimer -= dt;
-    if (_trailTimer <= 0) {
-      _trailTimer = 0.09;
-      parent?.add(TrailDotComponent(
-        position: position + Vector2(size.x / 2, size.y * 0.92),
-        color: isPlayerTwo ? AppColors.iceBlue : AppColors.cheeseYellow,
-        radius: 4.5,
-      ));
-    }
-  }
-
-  /// Versus mode: sinusundan ng remote Jerry ang posisyong galing sa network
-  /// (smooth interpolation sa pagitan ng ~8 updates/segundo).
-  void _updateRemote(double dt) {
-    _facingLerp += (_facing - _facingLerp) * min(1.0, dt * 12);
-    final target = remoteTarget;
-    if (target == null) {
-      _isMoving = false;
-      return;
-    }
-    final diff = target - position;
-    final dist = diff.length;
-    if (dist < 0.6 || dist > cellSize * 4) {
-      position.setFrom(target);
-      _isMoving = false;
-      return;
-    }
-    position.add(diff * min(1.0, dt * 14));
-    _isMoving = true;
-    _animTime += dt;
-    _velocity.setFrom(diff);
-    _velocity.normalize();
-    if (diff.x.abs() > 0.5) {
-      _facing = diff.x > 0 ? 1 : -1;
-    }
     _trailTimer -= dt;
     if (_trailTimer <= 0) {
       _trailTimer = 0.09;
@@ -3684,19 +3203,7 @@ class TomChaser extends PositionComponent
   double _trailTimer = 0;
   Vector2 _lastDir = Vector2(1, 0);
 
-  // Versus mode: isHuman = tao ang kumokontrol kay Tom (hindi AI).
-  // isRemote = ang tao ay nasa kabilang device; galing sa network ang posisyon.
-  final bool isHuman;
-  final bool isRemote;
-  Vector2? remoteTarget;
-
-  TomChaser({
-    required this.gridPosition,
-    required this.speed,
-    required this.game,
-    this.isHuman = false,
-    this.isRemote = false,
-  })
+  TomChaser({required this.gridPosition, required this.speed, required this.game})
       : super(
           position: gridPosition * cellSize + Vector2.all(cellSize * 0.05),
           size: Vector2.all(cellSize * 0.9),
@@ -3838,111 +3345,6 @@ class TomChaser extends PositionComponent
 
     canvas.restore(); // flip
     canvas.restore(); // hop/squash
-
-    // "TOM" label para sa Tom na kinokontrol ng tao (versus mode).
-    if (isHuman) {
-      final labelPainter = TextPainter(
-        text: TextSpan(
-          text: 'TOM',
-          style: TextStyle(
-            fontSize: h * 0.22,
-            fontWeight: FontWeight.w900,
-            color: Colors.redAccent,
-            shadows: const [Shadow(color: Colors.black, blurRadius: 3, offset: Offset(0.5, 0.5))],
-          ),
-        ),
-        textDirection: TextDirection.ltr,
-      );
-      labelPainter.layout();
-      labelPainter.paint(canvas, Offset(w / 2 - labelPainter.width / 2, -h * 0.34));
-    }
-  }
-
-  // ---- Versus mode: Tom na kinokontrol ng tao ----
-  static const double _humanWallMargin = 0.22;
-
-  Rect _humanWallRect(double px, double py) {
-    final mx = size.x * _humanWallMargin;
-    final my = size.y * _humanWallMargin;
-    return Rect.fromLTWH(px + mx, py + my, size.x - mx * 2, size.y - my * 2);
-  }
-
-  void _updateHuman(double dt) {
-    if (isRemote) {
-      _updateRemoteHuman(dt);
-      return;
-    }
-
-    final v = Vector2.zero();
-    final keys = HardwareKeyboard.instance;
-    if (keys.isLogicalKeyPressed(LogicalKeyboardKey.arrowUp) ||
-        keys.isLogicalKeyPressed(LogicalKeyboardKey.keyW)) v.y -= 1;
-    if (keys.isLogicalKeyPressed(LogicalKeyboardKey.arrowDown) ||
-        keys.isLogicalKeyPressed(LogicalKeyboardKey.keyS)) v.y += 1;
-    if (keys.isLogicalKeyPressed(LogicalKeyboardKey.arrowLeft) ||
-        keys.isLogicalKeyPressed(LogicalKeyboardKey.keyA)) v.x -= 1;
-    if (keys.isLogicalKeyPressed(LogicalKeyboardKey.arrowRight) ||
-        keys.isLogicalKeyPressed(LogicalKeyboardKey.keyD)) v.x += 1;
-    v.add(game.p1TouchDirection.value);
-
-    _isMoving = v.length2 > 0;
-    if (!_isMoving) return;
-
-    _animTime += dt;
-    if (v.x.abs() > 0.01) {
-      _facing = v.x > 0 ? 1 : -1;
-    }
-    v.normalize();
-    _lastDir = v.clone();
-
-    final delta = v * speed * dt;
-    final tryX = _humanWallRect(position.x + delta.x, position.y);
-    if (!rectHitsWall(tryX)) position.x += delta.x;
-    final tryY = _humanWallRect(position.x, position.y + delta.y);
-    if (!rectHitsWall(tryY)) position.y += delta.y;
-
-    _trailTimer -= dt;
-    if (_trailTimer <= 0) {
-      _trailTimer = 0.11;
-      parent?.add(TrailDotComponent(
-        position: position + Vector2(size.x / 2, size.y * 0.92),
-        color: Colors.redAccent,
-        radius: 5.5,
-        duration: 0.5,
-      ));
-    }
-  }
-
-  void _updateRemoteHuman(double dt) {
-    final target = remoteTarget;
-    if (target == null) {
-      _isMoving = false;
-      return;
-    }
-    final diff = target - position;
-    final dist = diff.length;
-    if (dist < 0.6 || dist > cellSize * 4) {
-      position.setFrom(target);
-      _isMoving = false;
-      return;
-    }
-    position.add(diff * min(1.0, dt * 14));
-    _isMoving = true;
-    _animTime += dt;
-    _lastDir = diff.normalized();
-    if (diff.x.abs() > 0.5) {
-      _facing = diff.x > 0 ? 1 : -1;
-    }
-    _trailTimer -= dt;
-    if (_trailTimer <= 0) {
-      _trailTimer = 0.11;
-      parent?.add(TrailDotComponent(
-        position: position + Vector2(size.x / 2, size.y * 0.92),
-        color: Colors.redAccent,
-        radius: 5.5,
-        duration: 0.5,
-      ));
-    }
   }
 
   Point<int> _cellOfCenter(Vector2 center) {
@@ -3989,11 +3391,6 @@ class TomChaser extends PositionComponent
     if (_spawnT < 1) _spawnT = (_spawnT + dt * 3).clamp(0.0, 1.0);
 
     _facingLerp += (_facing - _facingLerp) * min(1.0, dt * 10);
-
-    if (isHuman) {
-      _updateHuman(dt);
-      return;
-    }
 
     _repathTimer -= dt;
     if (_repathTimer <= 0 || _path.isEmpty) {
@@ -5145,6 +4542,7 @@ class ModeSelectOverlay extends StatelessWidget {
                   textColor: Colors.white,
                   onTap: () {
                     game.isTwoPlayerMode = true;
+                    game.overlays.remove('ModeSelect');
                     Navigator.push(
                       context,
                       MaterialPageRoute(
@@ -6753,12 +6151,7 @@ class HudOverlay extends StatelessWidget {
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Text(
-                  game.isVersusMode
-                      ? (game.playerRole == 'tom' ? 'YOU: TOM  |  CHEESE: ' : 'YOU: JERRY  |  CHEESE: ')
-                      : 'P1 (${game.playerName}): ',
-                  style: p1Style,
-                ),
+                Text('P1 (${game.playerName}): ', style: p1Style),
                 ValueListenableBuilder<int>(
                   valueListenable: game.p1ScoreNotifier,
                   builder: (context, score, _) => _animatedScore(score, p1Style),
@@ -6801,7 +6194,7 @@ class HudOverlay extends StatelessWidget {
                 IconButton(
                   iconSize: 30,
                   icon: Icon(Icons.pause, color: isDark ? Colors.white : AppColors.lightText),
-                  onPressed: game.isVersusMode ? null : () => game.pauseGame(),
+                  onPressed: () => game.pauseGame(),
                 ),
               ],
             ),
@@ -7052,8 +6445,7 @@ class IntelClubLogoPainter extends CustomPainter {
 /// point — never back through AuthMenu.
 class WaitingScreen extends StatefulWidget {
   final String roomId;
-  final String role; // 'tom' | 'jerry' (role ng host)
-  const WaitingScreen({super.key, required this.roomId, this.role = 'tom'});
+  const WaitingScreen({super.key, required this.roomId});
 
   @override
   State<WaitingScreen> createState() => _WaitingScreenState();
@@ -7061,9 +6453,6 @@ class WaitingScreen extends StatefulWidget {
 
 class _WaitingScreenState extends State<WaitingScreen> {
   bool _navigated = false;
-
-  String get _myName => widget.role == 'tom' ? 'Tom' : 'Jerry';
-  String get _opponentName => widget.role == 'tom' ? 'Jerry' : 'Tom';
 
   @override
   Widget build(BuildContext context) {
@@ -7077,8 +6466,11 @@ class _WaitingScreenState extends State<WaitingScreen> {
           if (snapshot.hasData && snapshot.data!.exists) {
             final data = snapshot.data!.data() as Map<String, dynamic>;
 
-            // Kapag naging 'playing' na ang status, lilipat sa laro.
-            // Guarded ng _navigated para hindi paulit-ulit ang push.
+            // Kapag naging 'playing' na ang status galing sa Firestore,
+            // lilipat si Tom papunta sa aktwal na laro (hindi na pabalik
+            // sa AuthMenu) — sa sandaling ito lang tayo mag-navigate,
+            // guarded ng _navigated para hindi paulit-ulit i-push ang
+            // route sa bawat snapshot update.
             if (data['status'] == 'playing' && !_navigated) {
               _navigated = true;
               WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -7086,12 +6478,10 @@ class _WaitingScreenState extends State<WaitingScreen> {
                 Navigator.pushReplacement(
                   context,
                   MaterialPageRoute(
-                    builder: (context) => GameApp(
+                    builder: (context) => const GameApp(
                       startInGame: true,
                       startTwoPlayer: true,
-                      playerName: _myName,
-                      roomId: widget.roomId,
-                      role: widget.role,
+                      playerName: 'Tom',
                     ),
                   ),
                 );
@@ -7099,120 +6489,20 @@ class _WaitingScreenState extends State<WaitingScreen> {
             }
           }
 
-          return Center(
+          return const Center(
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                const CircularProgressIndicator(),
-                const SizedBox(height: 20),
+                CircularProgressIndicator(),
+                SizedBox(height: 20),
                 Text(
-                  'Room ${widget.roomId} \u2022 Ikaw si $_myName',
-                  style: const TextStyle(fontSize: 16),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  'Waiting for $_opponentName to join...',
-                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  'Waiting for Jerry to join...',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                 ),
               ],
             ),
           );
         },
-      ),
-    );
-  }
-}
-
-
-/// Resulta ng Tom vs Jerry na laban: panalo/talo, REMATCH at LEAVE ROOM.
-class VersusResultOverlay extends StatelessWidget {
-  final TomAndJerryGame game;
-  const VersusResultOverlay({super.key, required this.game});
-
-  @override
-  Widget build(BuildContext context) {
-    final isDark = game.isDarkModeNotifier.value;
-    final textColor = isDark ? AppColors.softWhite : AppColors.lightText;
-    final winner = game.versusWinner;
-    final left = winner == 'left';
-    final iWon = winner == game.playerRole;
-
-    String title;
-    String subtitle;
-    Color titleColor;
-    if (left) {
-      title = 'OPPONENT LEFT';
-      subtitle = 'Umalis ang kalaban sa room.';
-      titleColor = AppColors.cheeseYellow;
-    } else if (iWon) {
-      title = 'YOU WIN!';
-      subtitle = winner == 'tom' ? 'Nahuli mo si Jerry!' : 'Nakakuha ka ng sapat na cheese!';
-      titleColor = AppColors.cheeseYellow;
-    } else {
-      title = 'YOU LOSE';
-      subtitle = winner == 'tom' ? 'Nahuli ka ni Tom!' : 'Naunahan ka ni Jerry sa cheese!';
-      titleColor = Colors.redAccent;
-    }
-
-    return Container(
-      color: Colors.black.withValues(alpha: 0.5),
-      child: Center(
-        child: PopIn(
-          child: GlassPanel(
-            isDarkMode: isDark,
-            borderColor: titleColor,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                LoopingPulse(
-                  minScale: 0.97,
-                  maxScale: 1.06,
-                  child: Text(
-                    title,
-                    textAlign: TextAlign.center,
-                    style: TextStyle(color: titleColor, fontSize: 32, fontWeight: FontWeight.bold),
-                  ),
-                ),
-                const SizedBox(height: 10),
-                Text(subtitle, textAlign: TextAlign.center, style: TextStyle(color: textColor, fontSize: 16)),
-                const SizedBox(height: 6),
-                Text(
-                  'Cheese score: ${game.p1ScoreNotifier.value}',
-                  style: TextStyle(color: textColor.withValues(alpha: 0.8), fontSize: 14),
-                ),
-                const SizedBox(height: 22),
-                if (!left)
-                  ValueListenableBuilder<bool>(
-                    valueListenable: game.rematchWaitingNotifier,
-                    builder: (context, waiting, _) => waiting
-                        ? Padding(
-                            padding: const EdgeInsets.symmetric(vertical: 14),
-                            child: Text(
-                              'Waiting for opponent...',
-                              style: TextStyle(color: textColor, fontSize: 16, fontWeight: FontWeight.bold),
-                            ),
-                          )
-                        : ArcadeButton(
-                            label: 'REMATCH',
-                            color: isDark ? AppColors.brightCyan : AppColors.lightPrimary,
-                            textColor: isDark ? AppColors.darkNavy : Colors.white,
-                            onTap: () => game.requestRematch(),
-                          ),
-                  ),
-                const SizedBox(height: 8),
-                ArcadeButton(
-                  label: 'LEAVE ROOM',
-                  color: AppColors.deepBlue,
-                  textColor: Colors.white,
-                  onTap: () {
-                    game.leaveVersus();
-                    Navigator.of(context).popUntil((route) => route.isFirst);
-                  },
-                ),
-              ],
-            ),
-          ),
-        ),
       ),
     );
   }
