@@ -4578,7 +4578,7 @@ class _AuthOverlayState extends State<AuthOverlay> {
                   const SizedBox(height: 22),
                   TextField(
                     controller: _usernameController,
-                    enabled: !_isProcessing,
+                    readOnly: _isProcessing,
                     style: TextStyle(color: textColor, fontSize: 18),
                     decoration: InputDecoration(
                       labelText: widget.game.tr('username'),
@@ -4592,7 +4592,7 @@ class _AuthOverlayState extends State<AuthOverlay> {
                   TextField(
                     controller: _passwordController,
                     obscureText: _obscurePassword,
-                    enabled: !_isProcessing,
+                    readOnly: _isProcessing,
                     style: TextStyle(color: textColor, fontSize: 18),
                     decoration: InputDecoration(
                       labelText: widget.game.tr('password'),
@@ -4619,7 +4619,7 @@ class _AuthOverlayState extends State<AuthOverlay> {
                             child: TextField(
                               controller: _confirmPasswordController,
                               obscureText: _obscurePassword,
-                              enabled: !_isProcessing,
+                              readOnly: _isProcessing,
                               style: TextStyle(color: textColor, fontSize: 18),
                               decoration: InputDecoration(
                                 labelText: widget.game.tr('confirm_password'),
